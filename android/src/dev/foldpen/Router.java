@@ -60,7 +60,10 @@ final class Router {
     static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450;
     static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
     static final float SLOP_MM = 6, SWIPE_MM = 18, EDGE_MM = 2.5f;
-    static final float PALM_MM = 12, PALM_MAX_MM = 22, PALM_NEAR_MM = 22, PALM_SIDE_MM = 45;
+    // Contact size, in getTouchMajor units over px/mm. On the Fold these are
+    // not real mm, but they separate cleanly (measured): dummy pen 0.1-0.2,
+    // fingertip 0.3-0.5, palm 1.0-5.0 (landing ~0.6 and growing).
+    static final float PALM_MM = 0.8f, PALM_EMA_X = 3, PALM_MAX_MM = 22, PALM_NEAR_MM = 15;
     static final float FINGER_PEN_PRESSURE = 0.5f;
 
     static final int PEN_IN_RANGE = 1, PEN_TOUCH = 2, PEN_BTN1 = 4, PEN_ERASER = 8, PEN_BTN2 = 16;
@@ -73,6 +76,7 @@ final class Router {
         final long downT;
         final float x0, y0;
         float x, y, major, gx0, gy0, lastMajor;
+        float minor, size, pressure, path;        // maxima / total, for tuning
         long lastT;
         S state = S.PENDING;
         boolean palm, cancel;
@@ -291,17 +295,23 @@ final class Router {
     /** `adb logcat -s foldpen-palm` -- every contact decision, for tuning. */
     private void dbg(Contact c, String what) {
         Log.d("foldpen-palm", String.format(java.util.Locale.ROOT,
-                "#%d %-14s t=%4dms at=(%.0f,%.0f)mm moved=%.1fmm major=%.1fmm thr=%.1fmm ema=%.1fmm pen=%s",
+                "#%d %-14s t=%4dms at=(%.0f,%.0f)mm moved=%.1fmm path=%.1fmm major=%.2fpx minor=%.2fpx size=%.4f pres=%.3f pen=%s",
                 c.id, what, SystemClock.uptimeMillis() - c.downT, c.x / mm, c.y / mm,
-                Math.hypot(c.x - c.x0, c.y - c.y0) / mm, c.major / mm, palmThreshold() / mm, majorEma / mm,
+                Math.hypot(c.x - c.x0, c.y - c.y0) / mm, c.path / mm, c.major, c.minor, c.size, c.pressure,
                 penFinger == null ? "-" : "#" + penFinger.id));
     }
 
     private void fingerDown(MotionEvent e, int i, long t) {
         float x = e.getX(i), y = e.getY(i);
         Contact c = new Contact(e.getPointerId(i), t, x, y, e.getTouchMajor(i));
+        c.minor = e.getTouchMinor(i); c.size = e.getSize(i); c.pressure = e.getPressure(i);
         contacts.put(c.id, c);
-        if (gesture) { joinGesture(c); return; }
+        if (gesture) {
+            // a palm landing mid-gesture is not another finger of it
+            if (palmLike(c)) { c.state = S.REJECTED; dbg(c, "rej:palm-size"); }
+            else joinGesture(c);
+            return;
+        }
         dbg(c, "down");
         if (stylusRecently()) { c.state = S.REJECTED; dbg(c, "rej:stylus"); return; }
         if (edit) c.state = S.EDIT;
@@ -332,6 +342,10 @@ final class Router {
                         && (maj > c.lastMajor * SIZE_JUMP || maj * SIZE_JUMP < c.lastMajor)));
             c.lastMajor = maj;
             c.lastT = st;
+            c.path += jump * mm;
+            c.minor = Math.max(c.minor, cur ? e.getTouchMinor(i) : e.getHistoricalTouchMinor(i, k));
+            c.size = Math.max(c.size, cur ? e.getSize(i) : e.getHistoricalSize(i, k));
+            c.pressure = Math.max(c.pressure, cur ? e.getPressure(i) : e.getHistoricalPressure(i, k));
             c.x = x; c.y = y;
             c.major = Math.max(c.major, maj);
             if (corrupt && (c.state == S.PENDING || c == penFinger)) {
@@ -360,6 +374,14 @@ final class Router {
                     } else touchDirty = true;
                     break;
                 case TWO:
+                    if (palmLike(c)) {          // not a two-finger tap: a hand
+                        for (Contact o : new Contact[]{twoA, twoB})
+                            if (o != null && o != c && o.state == S.TWO) o.state = S.PENDING;
+                        twoA = twoB = null;
+                        markPalm(c);
+                        dbg(c, "two:palm");
+                        break;
+                    }
                     c.buf.add(new float[]{x, y, st - c.downT});
                     if (Math.hypot(x - c.x0, y - c.y0) > WRITE_MM * mm) {
                         // it is writing: no button tap after all, an ordinary
@@ -372,6 +394,12 @@ final class Router {
                     }
                     break;
                 case GESTURE:
+                    if (palmLike(c)) {
+                        // a "finger" of the gesture grew into a palm: it was
+                        // the hand resting, not a gesture -- swallow it
+                        gestureFired = true;
+                        dbg(c, "gesture:palm");
+                    }
                     gestureMove();
                     break;
                 default:
@@ -501,7 +529,7 @@ final class Router {
      *  contacts have actually measured (a fingertip-sized dummy pen and a
      *  fine-tipped one end up with different thresholds). */
     private float palmThreshold() {
-        return Math.min(Math.max(PALM_MM * mm, majorEma * 2.0f), PALM_MAX_MM * mm);
+        return Math.min(Math.max(PALM_MM * mm, majorEma * PALM_EMA_X), PALM_MAX_MM * mm);
     }
 
     private boolean palmLike(Contact c) {
@@ -528,16 +556,16 @@ final class Router {
         for (float[] p : palms) if (p[3] == 0 && p[4] == c.id) p[3] = SystemClock.uptimeMillis();
     }
 
-    /** With a palm resting (or just lifted), the pen tip is above it. Anything
-     *  level with or below the palm, or right next to it, is more hand. */
+    /** A contact landing right next to a resting (or just-lifted) palm is
+     *  more hand. Distance only: in landscape the pen is not reliably "above"
+     *  the palm. */
     private boolean nearPalm(Contact c) {
         long now = SystemClock.uptimeMillis();
         for (int i = palms.size() - 1; i >= 0; i--) {
             float[] p = palms.get(i);
             if (p[3] != 0 && now - p[3] > PALM_MEMORY_MS) { palms.remove(i); continue; }
             float dx = c.x0 - p[0], dy = c.y0 - p[1];
-            if (Math.hypot(dx, dy) < Math.max(p[2] * 1.5f, PALM_NEAR_MM * mm)) return true;
-            if (dy > -p[2] && Math.abs(dx) < PALM_SIDE_MM * mm) return true;
+            if (Math.hypot(dx, dy) < PALM_NEAR_MM * mm) return true;
         }
         return false;
     }
@@ -618,7 +646,7 @@ final class Router {
         int n = 0;
         for (int i = 0; i < contacts.size(); i++) {
             Contact c = contacts.valueAt(i);
-            if (c.state != S.REJECTED && now - c.downT <= GESTURE_SPREAD_MS) n++;
+            if (c.state != S.REJECTED && !palmLike(c) && now - c.downT <= GESTURE_SPREAD_MS) n++;
         }
         if (n < 3) return false;
         gesture = true;
@@ -627,7 +655,7 @@ final class Router {
         gestureT0 = now;
         for (int i = 0; i < contacts.size(); i++) {
             Contact c = contacts.valueAt(i);
-            if (c.state != S.REJECTED && now - c.downT <= GESTURE_SPREAD_MS) {
+            if (c.state != S.REJECTED && !palmLike(c) && now - c.downT <= GESTURE_SPREAD_MS) {
                 cancelContact(c);
                 joinGesture(c);
             }
