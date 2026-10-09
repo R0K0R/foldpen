@@ -394,6 +394,7 @@ class Daemon:
             return
         self.overlay = p
         self.overlay_push()
+        done = False
         while True:
             line = await p.stdout.readline()
             if not line:
@@ -408,13 +409,19 @@ class Daemon:
                 self.fit_rect([rx + mx, ry + my, rw, rh])
                 self.changed(save=True)
             if m.get("done"):
+                done = True
                 break
-        await p.wait()
+        rc = await p.wait()
         if self.overlay is p:
             self.overlay = None
-            if self.st.edit:
+            # Only the user's "done" (Esc / right click) leaves edit mode. An
+            # overlay that crashed just means no border on the PC; editing
+            # from the phone still works, and a toggle there ends it.
+            if done and self.st.edit:
                 self.st.edit = False
                 self.changed(save=True)
+            elif not done:
+                log(f"edit overlay exited ({rc}); edit mode stays on")
 
     def overlay_push(self):
         p = self.overlay

@@ -1,4 +1,5 @@
 { lib, stdenvNoCC, makeWrapper, python3, gobject-introspection, gtk3, gtk-layer-shell
+, pango, gdk-pixbuf, atk, harfbuzz
 , grim, hyprland, iproute2, android-tools, jdk17_headless, libnotify, apk }:
 
 let
@@ -15,7 +16,7 @@ stdenvNoCC.mkDerivation {
     makeWrapper ${python}/bin/python3 $out/bin/foldpen \
       --add-flags $out/share/foldpen/foldpen.py \
       --set FOLDPEN_APK ${apk} \
-      --prefix GI_TYPELIB_PATH : ${lib.makeSearchPath "lib/girepository-1.0" [ gtk3 gtk-layer-shell gobject-introspection ]} \
+      --prefix GI_TYPELIB_PATH : ${lib.makeSearchPath "lib/girepository-1.0" (map (p: p.out) [ gtk3 gtk-layer-shell gobject-introspection pango gdk-pixbuf atk harfbuzz ])} \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ gtk-layer-shell ]} \
       --suffix PATH : ${lib.makeBinPath [ grim hyprland iproute2 android-tools jdk17_headless libnotify ]}
   '';
