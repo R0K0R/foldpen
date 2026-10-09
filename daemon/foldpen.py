@@ -52,6 +52,8 @@ T_STATE, T_FRAME = 10, 11
 
 PEN_IN_RANGE, PEN_TOUCH, PEN_BTN1, PEN_ERASER, PEN_BTN2 = 1, 2, 4, 8, 16
 TOUCH_DOWN, TOUCH_PALM = 1, 2
+# linux/input.h; python-evdev's ecodes does not export the MT_TOOL_* values
+MT_TOOL_FINGER, MT_TOOL_PALM = 0, 2
 
 ABS_MAX = 32767
 PRESSURE_MAX = 4095
@@ -59,6 +61,12 @@ PRESSURE_MAX = 4095
 # threshold of a few percent of the range. A light S Pen stroke reports far
 # less than that, so a touching sample is lifted onto [TIP_FLOOR, 1].
 TIP_FLOOR = 0.06
+# A pen that arrives already pressed (a finger-pen, an S Pen tap without hover)
+# gets proximity-in alone and its samples held this long before the tip goes
+# down. libinput delivers both in order, but Hyprland/the client lose a tip-
+# down that lands in the same instant as proximity-in -- the start of the
+# stroke came out as hover. One or two compositor frames is enough.
+PROX_LEAD = 0.03
 
 STYLUS_NAME = "foldpen-stylus"
 TOUCH_NAME = "foldpen-touch"
@@ -202,7 +210,7 @@ class Devices:
                     # MT_TOOL_PALM makes libinput send touch CANCEL, not up, so
                     # a touch that turned out to start a phone gesture never
                     # becomes a tap on the desktop.
-                    u.write(e.EV_ABS, e.ABS_MT_TOOL_TYPE, e.MT_TOOL_PALM)
+                    u.write(e.EV_ABS, e.ABS_MT_TOOL_TYPE, MT_TOOL_PALM)
                     u.syn()
                     u.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
                 u.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
@@ -217,7 +225,7 @@ class Devices:
                 self.slots[slot] = self.next_tid
                 self.next_tid = self.next_tid % 65000 + 1
                 u.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, self.slots[slot])
-                u.write(e.EV_ABS, e.ABS_MT_TOOL_TYPE, e.MT_TOOL_FINGER)
+                u.write(e.EV_ABS, e.ABS_MT_TOOL_TYPE, MT_TOOL_FINGER)
             u.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
             u.write(e.EV_ABS, e.ABS_MT_POSITION_Y, y)
             first = first or (x, y)
@@ -276,6 +284,7 @@ class Daemon:
         self.pair_code = None       # (code, expiry)
         self.last_input = 0.0
         self.frame_wake = asyncio.Event()
+        self.pen_q = None           # samples held behind a fresh proximity-in
         self.refresh_monitors()
 
     # geometry ----------------------------------------------------------------
@@ -472,6 +481,7 @@ class Daemon:
         finally:
             if self.client and self.client[1] is writer:
                 self.client = None
+                self.pen_q = None
                 self.dev.release_all()
             writer.close()
 
@@ -496,7 +506,15 @@ class Daemon:
             flags, u, v, pr, tx, ty = struct.unpack(">Bfffff", p)
             if self.mon:
                 x, y = self.to_abs(u, v)
-                self.dev.pen_event(flags, x, y, pr, int(tx), int(ty))
+                ev = (flags, x, y, pr, int(tx), int(ty))
+                if self.pen_q is not None:
+                    self.pen_q.append(ev)
+                elif flags & PEN_TOUCH and not self.dev.pen_state["range"]:
+                    self.dev.pen_event(flags & ~PEN_TOUCH, x, y, 0.0, int(tx), int(ty))
+                    self.pen_q = [ev]
+                    asyncio.get_running_loop().call_later(PROX_LEAD, self.flush_pen)
+                else:
+                    self.dev.pen_event(*ev)
             self.last_input = time.monotonic()
         elif t == T_TOUCH:
             n = p[0]
@@ -517,6 +535,11 @@ class Daemon:
                              m.get("cx", 0.5), m.get("cy", 0.5))
         elif t == T_VIEW:
             self.set_view(json.loads(p))
+
+    def flush_pen(self):
+        q, self.pen_q = self.pen_q or [], None
+        for ev in q:
+            self.dev.pen_event(*ev)
 
     # display forwarding ----------------------------------------------------------
     async def frame_loop(self, writer):

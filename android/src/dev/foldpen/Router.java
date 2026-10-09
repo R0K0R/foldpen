@@ -4,6 +4,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.Log;
 import android.util.SparseArray;
 import android.view.MotionEvent;
 
@@ -21,11 +22,11 @@ import java.util.ArrayList;
  *
  *  Fingers: held back first (buffered, not dropped), long enough to see
  *  whether they are a palm or the start of a 3-finger gesture. Then:
- *    finger mode "pen"   -> one contact is the pen (a dummy stylus): the one
- *                           that starts WRITING. A pen that is moving keeps
- *                           it (active-write-win); otherwise the newest writer
- *                           takes it (last-writer-wins), because the pen tip
- *                           lands after the palm. Still contacts are hand.
+ *    finger mode "pen"   -> one contact is the pen (a dummy stylus): the
+ *                           newest one whose stroke qualifies (it writes, it
+ *                           is not a blip, not idle, not corrupted) -- last-
+ *                           writer-wins, because the pen tip lands after the
+ *                           palm. Strokes that don't qualify are dropped.
  *    finger mode "touch" -> every finger is a touchscreen contact.
  *
  *  Gestures, always three fingers, so they work without looking:
@@ -39,6 +40,7 @@ final class Router {
         void toggle(String what);
         void ink(float x, float y, boolean down);
         void hover(float x, float y, boolean inRange);
+        void tick();
     }
 
     // timing (ms) and distances (mm)
@@ -46,8 +48,13 @@ final class Router {
     // finger = pen: a contact is the pen once it WRITES (moves WRITE_MM); one
     // that sits still for REST_MS first is a resting hand. A tap is a contact
     // lifted before REST_MS without writing.
-    static final long REST_MS = 400, ACTIVE_WRITE_MS = 120;
-    static final float WRITE_MM = 1.2f, ACTIVE_MOVE_MM = 0.4f;
+    // Strokes are buffered until they qualify and dropped if they don't:
+    // shorter than BLIP_MS, idle for REST_MS before writing, or corrupted --
+    // a sample jumping JUMP_MM or a contact size changing by SIZE_JUMP x
+    // between samples (a palm merging / splitting). Corruption after a stroke
+    // went live ends it there.
+    static final long REST_MS = 400, BLIP_MS = 50;
+    static final float WRITE_MM = 1.2f, JUMP_MM = 12, SIZE_JUMP = 2.0f;
     static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450;
     static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
     static final float SLOP_MM = 6, SWIPE_MM = 18, EDGE_MM = 2.5f;
@@ -57,20 +64,19 @@ final class Router {
     static final int PEN_IN_RANGE = 1, PEN_TOUCH = 2, PEN_BTN1 = 4, PEN_ERASER = 8, PEN_BTN2 = 16;
     static final int TOUCH_DOWN = 1, TOUCH_PALM = 2;
 
-    enum S { PENDING, ACTIVE, REJECTED, GESTURE, EDIT }
+    enum S { PENDING, ACTIVE, REJECTED, GESTURE, EDIT, TWO }
 
     static final class Contact {
         final int id;
         final long downT;
         final float x0, y0;
-        float x, y, major, gx0, gy0, mx, my;
-        long movedT;
+        float x, y, major, gx0, gy0, lastMajor;
         S state = S.PENDING;
         boolean palm, cancel;
         int slot = -1;
         final ArrayList<float[]> buf = new ArrayList<>();
         Contact(int id, long t, float x, float y, float major) {
-            this.id = id; downT = t; x0 = this.x = mx = x; y0 = this.y = my = y; this.major = major; movedT = t;
+            this.id = id; downT = t; x0 = this.x = x; y0 = this.y = y; this.major = lastMajor = major;
         }
     }
 
@@ -97,6 +103,10 @@ final class Router {
     private boolean touchDirty;
 
     // gesture
+    // finger = pen: two fingers tapped together = the pen's side button
+    static final long TWO_SPREAD_MS = 150, TWO_TAP_MS = 350;
+    private Contact twoA, twoB;
+
     private boolean gesture, gestureFired;
     private long gestureT0;
     private float gestureMax;
@@ -267,19 +277,30 @@ final class Router {
 
     // ================================================================ fingers
 
+    /** `adb logcat -s foldpen-palm` -- every contact decision, for tuning. */
+    private void dbg(Contact c, String what) {
+        Log.d("foldpen-palm", String.format(java.util.Locale.ROOT,
+                "#%d %-14s t=%4dms at=(%.0f,%.0f)mm moved=%.1fmm major=%.1fmm thr=%.1fmm ema=%.1fmm pen=%s",
+                c.id, what, SystemClock.uptimeMillis() - c.downT, c.x / mm, c.y / mm,
+                Math.hypot(c.x - c.x0, c.y - c.y0) / mm, c.major / mm, palmThreshold() / mm, majorEma / mm,
+                penFinger == null ? "-" : "#" + penFinger.id));
+    }
+
     private void fingerDown(MotionEvent e, int i, long t) {
         float x = e.getX(i), y = e.getY(i);
         Contact c = new Contact(e.getPointerId(i), t, x, y, e.getTouchMajor(i));
         contacts.put(c.id, c);
         if (gesture) { joinGesture(c); return; }
-        if (stylusRecently()) { c.state = S.REJECTED; return; }
+        dbg(c, "down");
+        if (stylusRecently()) { c.state = S.REJECTED; dbg(c, "rej:stylus"); return; }
         if (edit) c.state = S.EDIT;
         else if (finger.equals("pen")) {
-            if (atEdge(c)) c.state = S.REJECTED;
-            else if (palmLike(c)) markPalm(c);
+            if (atEdge(c)) { c.state = S.REJECTED; dbg(c, "rej:edge"); }
+            else if (palmLike(c)) { markPalm(c); dbg(c, "rej:palm-size"); }
         }
         c.buf.add(new float[]{x, y});
         if (maybeStartGesture(t)) return;
+        if (c.state == S.PENDING && finger.equals("pen") && penFinger == null) maybeTwoTap(c, t);
         if (c.state == S.PENDING) {
             handler.removeCallbacks(tick);
             handler.postDelayed(tick, holdMs());
@@ -292,14 +313,21 @@ final class Router {
             float x = cur ? e.getX(i) : e.getHistoricalX(i, k);
             float y = cur ? e.getY(i) : e.getHistoricalY(i, k);
             float maj = cur ? e.getTouchMajor(i) : e.getHistoricalTouchMajor(i, k);
+            boolean corrupt = finger.equals("pen") && (Math.hypot(x - c.x, y - c.y) > JUMP_MM * mm
+                    || (c.lastMajor > 0 && maj > 0 && (maj > c.lastMajor * SIZE_JUMP || maj * SIZE_JUMP < c.lastMajor)));
+            c.lastMajor = maj;
             c.x = x; c.y = y;
             c.major = Math.max(c.major, maj);
-            if (Math.hypot(x - c.mx, y - c.my) > ACTIVE_MOVE_MM * mm) {
-                c.mx = x; c.my = y; c.movedT = SystemClock.uptimeMillis();
+            if (corrupt && (c.state == S.PENDING || c == penFinger)) {
+                dbg(c, c == penFinger ? "end:corrupt" : "rej:corrupt");
+                if (c == penFinger) endPenFinger(false);
+                c.state = S.REJECTED;
+                c.buf.clear();
+                continue;
             }
             switch (c.state) {
                 case PENDING:
-                    if (finger.equals("pen") && palmLike(c)) { markPalm(c); break; }
+                    if (finger.equals("pen") && palmLike(c)) { markPalm(c); dbg(c, "rej:palm-grew"); break; }
                     c.buf.add(new float[]{x, y});
                     if (finger.equals("pen") && Math.hypot(x - c.x0, y - c.y0) > WRITE_MM * mm) claimPen(c);
                     break;
@@ -308,11 +336,24 @@ final class Router {
                         if (palmLike(c)) {      // a palm rolled onto the "pen"
                             endPenFinger(false);
                             markPalm(c);
+                            dbg(c, "end:palm-grew");
                         } else {
                             sendPen(PEN_IN_RANGE | PEN_TOUCH, x / w, y / h, FINGER_PEN_PRESSURE, 0, 0);
                             host.ink(x, y, true);
                         }
                     } else touchDirty = true;
+                    break;
+                case TWO:
+                    c.buf.add(new float[]{x, y});
+                    if (Math.hypot(x - c.x0, y - c.y0) > WRITE_MM * mm) {
+                        // it is writing: no button tap after all, an ordinary
+                        // stroke (its buffer intact), and LWW decides as usual
+                        dbg(c, "two:writes");
+                        for (Contact o : new Contact[]{twoA, twoB})
+                            if (o != null && o.state == S.TWO) o.state = S.PENDING;
+                        twoA = twoB = null;
+                        claimPen(c);
+                    }
                     break;
                 case GESTURE:
                     gestureMove();
@@ -326,12 +367,17 @@ final class Router {
     private void fingerUp(int id, boolean canceled) {
         Contact c = contacts.get(id);
         if (c == null) return;
+        dbg(c, "up:" + c.state + (canceled ? ":canceled" : ""));
         if (c.state == S.PENDING && !canceled) {
             // A quick tap, shorter than the hold window: decide now, and let
             // the daemon see it down before it goes up. In pen mode only while
             // nothing is writing -- a tap during a stroke is the hand bouncing.
             if (!finger.equals("pen")) activate(c);
-            else if (penFinger == null && SystemClock.uptimeMillis() - c.downT < REST_MS) claimPen(c);
+            else {
+                long held = SystemClock.uptimeMillis() - c.downT;
+                if (held < BLIP_MS) dbg(c, "rej:blip");
+                else if (held < REST_MS) claimPen(c);
+            }
             flushTouch();
         }
         contacts.remove(id);
@@ -345,6 +391,7 @@ final class Router {
         }
         if (c.palm) endPalm(c);
         if (c.state == S.GESTURE) gestureUp();
+        if (c == twoA || c == twoB) twoUp(c);
     }
 
     private long holdMs() { return finger.equals("pen") ? REST_MS : TOUCH_HOLD_MS; }
@@ -359,26 +406,26 @@ final class Router {
             if (c.state != S.PENDING) continue;
             long due = c.downT + holdMs();
             if (due > now) { next = Math.min(next, due); continue; }
-            if (finger.equals("pen")) { c.state = S.REJECTED; c.buf.clear(); }
+            if (finger.equals("pen")) { c.state = S.REJECTED; c.buf.clear(); dbg(c, "rej:resting"); }
             else activate(c);
         }
         if (next != Long.MAX_VALUE) handler.postDelayed(tick, Math.max(1, next - now));
         flushTouch();
     }
 
-    /** Pen mode arbitration, for a contact that has started writing.
-     *  Active-write-win: a pen that is moving right now keeps the pen.
-     *  Otherwise last-writer-wins: the newer contact takes it, and the older
-     *  one -- the palm the pen usually lands after -- is set aside for good. */
+    /** Pen mode arbitration, for a stroke that has qualified: last-writer-
+     *  wins. The newer contact takes the pen and the older one -- the palm
+     *  the pen usually lands after -- is set aside for good. */
     private void claimPen(Contact c) {
         Contact cur = penFinger;
         if (cur != null) {
-            boolean curWriting = SystemClock.uptimeMillis() - cur.movedT < ACTIVE_WRITE_MS;
-            if (curWriting || c.downT < cur.downT) {
+            if (c.downT < cur.downT) {
+                dbg(c, "rej:older");
                 c.state = S.REJECTED;
                 c.buf.clear();
                 return;
             }
+            dbg(cur, "lost:newer");
             endPenFinger(false);
         }
         activate(c);
@@ -395,6 +442,7 @@ final class Router {
         // finger = pen (claimPen has settled who): not a palm
         if (penFinger != null || stylusRecently() || palmLike(c) || nearPalm(c)) {
             if (palmLike(c)) markPalm(c); else c.state = S.REJECTED;
+            dbg(c, stylusRecently() ? "rej:stylus" : palmLike(c) ? "rej:palm-size" : "rej:near-palm");
             c.buf.clear();
             return;
         }
@@ -405,6 +453,7 @@ final class Router {
         }
         c.state = S.ACTIVE;
         penFinger = c;
+        dbg(c, "PEN");
         if (c.major > 0) majorEma = majorEma == 0 ? c.major : majorEma * 0.8f + c.major * 0.2f;
         float[] first = c.buf.get(0);
         sendPen(PEN_IN_RANGE, first[0] / w, first[1] / h, 0, 0, 0);     // proximity in
@@ -510,6 +559,41 @@ final class Router {
             if (contacts.get(c.id) == c) c.state = S.REJECTED;
         }
         cancelled.clear();
+    }
+
+    // ================================================================ 2-finger tap
+
+    private void maybeTwoTap(Contact c, long t) {
+        Contact other = null;
+        int n = 0;
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact o = contacts.valueAt(i);
+            if (o.state == S.REJECTED) continue;
+            n++;
+            if (o != c && o.state == S.PENDING && t - o.downT <= TWO_SPREAD_MS) other = o;
+        }
+        if (n != 2 || other == null) return;
+        twoA = other; twoB = c;
+        other.state = c.state = S.TWO;
+        dbg(c, "two:start");
+    }
+
+    private void twoUp(Contact c) {
+        Contact a = twoA, b = twoB;
+        if (a == null || b == null) return;
+        boolean bothUp = contacts.get(a.id) != a && contacts.get(b.id) != b;
+        if (!bothUp) return;
+        twoA = twoB = null;
+        long dur = SystemClock.uptimeMillis() - Math.min(a.downT, b.downT);
+        if (dur > TWO_TAP_MS || a.state != S.TWO || b.state != S.TWO) return;
+        float x = (a.x0 + b.x0) / 2 / w, y = (a.y0 + b.y0) / 2 / h;
+        // a tip tap with the barrel button held: the pen's "right click"
+        sendPen(PEN_IN_RANGE | PEN_BTN1, x, y, 0, 0, 0);
+        sendPen(PEN_IN_RANGE | PEN_TOUCH | PEN_BTN1, x, y, FINGER_PEN_PRESSURE, 0, 0);
+        sendPen(PEN_IN_RANGE | PEN_BTN1, x, y, 0, 0, 0);
+        sendPen(0, x, y, 0, 0, 0);
+        dbg(c, "two:BUTTON");
+        host.tick();
     }
 
     // ================================================================ gestures

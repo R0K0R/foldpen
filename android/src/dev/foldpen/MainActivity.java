@@ -161,6 +161,8 @@ public final class MainActivity extends Activity implements Link.Listener, Route
 
     @Override public void hover(float x, float y, boolean in) { view.hover(x, y, in); }
 
+    @Override public void tick() { buzz(0, 12); }
+
     // ---------------------------------------------------------------- Link.Listener (any thread)
 
     @Override public void onConnected(boolean c) {
