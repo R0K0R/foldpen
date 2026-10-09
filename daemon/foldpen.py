@@ -303,6 +303,7 @@ class Daemon:
         self.frame_wake = asyncio.Event()
         self.pen_q = None           # samples held behind a fresh proximity-in
         self.prox_out = None        # pending proximity-out after a tip-up
+        self.after_out = []         # samples waiting for that proximity-out
         self.pen_line = collections.deque()      # (phone s, event) awaiting playout
         self.pen_timer = None
         self.transit = collections.deque()       # (arrival, arrival - phone s)
@@ -505,6 +506,7 @@ class Daemon:
                 self.client = None
                 self.pen_q = None
                 self.pen_line.clear()
+                self.after_out = []
                 if self.pen_timer:
                     self.pen_timer.cancel()
                     self.pen_timer = None
@@ -594,21 +596,32 @@ class Daemon:
             self.pen_q.append(ev)
             return
         if self.prox_out:
-            self.prox_out.cancel()
-            self.prox_out = None
+            # A new stroke while the last one's proximity-out is pending (a
+            # finger-pen handoff, LWW): let the old pen leave fully first, or
+            # Rnote joined the two into one line from the palm to the pen.
+            self.after_out.append(ev)
+            return
         st = self.dev.pen_state
         loop = asyncio.get_running_loop()
         if not flags & PEN_IN_RANGE:
             if st["range"]:
                 if st["touch"]:
                     self.dev.pen_event(PEN_IN_RANGE, x, y, 0.0, tx, ty)    # tip up, still near
-                self.prox_out = loop.call_later(PROX_LEAD, self.dev.pen_event, 0, x, y, 0.0, 0, 0)
+                self.prox_out = loop.call_later(PROX_LEAD, self.leave, x, y)
         elif flags & PEN_TOUCH and not st["range"]:
             self.dev.pen_event(flags & ~PEN_TOUCH, x, y, 0.0, tx, ty)  # proximity in alone
             self.pen_q = [ev]
             loop.call_later(PROX_LEAD, self.flush_pen)
         else:
             self.dev.pen_event(*ev)
+
+    def leave(self, x, y):
+        """Proximity-out, then whatever queued behind it starts afresh."""
+        self.prox_out = None
+        self.dev.pen_event(0, x, y, 0.0, 0, 0)
+        q, self.after_out = self.after_out, []
+        for ev in q:
+            self.pen_input(ev)
 
     def flush_pen(self):
         """Replay held samples PEN_PACE apart; anything arriving meanwhile

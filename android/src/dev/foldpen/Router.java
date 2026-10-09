@@ -60,10 +60,11 @@ final class Router {
     static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450;
     static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
     static final float SLOP_MM = 6, SWIPE_MM = 18, EDGE_MM = 2.5f;
-    // Contact size, in getTouchMajor units over px/mm. On the Fold these are
-    // not real mm, but they separate cleanly (measured): dummy pen 0.1-0.2,
-    // fingertip 0.3-0.5, palm 1.0-5.0 (landing ~0.6 and growing).
-    static final float PALM_MM = 0.8f, PALM_EMA_X = 3, PALM_MAX_MM = 22, PALM_NEAR_MM = 15;
+    // Contact size (getTouchMajor / px-per-mm). On the Fold these are not
+    // real mm, but they separate (measured, 14.7 px/mm): dummy pen 0.5-2.5 px,
+    // fingertip 3.9-5.9 px, palm edge landing at 8+ px and growing to 12-60.
+    // 0.45 "mm" = 6.6 px sits between fingertips and palm edges.
+    static final float PALM_MM = 0.45f, PALM_EMA_X = 3, PALM_MAX_MM = 22, PALM_NEAR_MM = 15;
     static final float FINGER_PEN_PRESSURE = 0.5f;
 
     static final int PEN_IN_RANGE = 1, PEN_TOUCH = 2, PEN_BTN1 = 4, PEN_ERASER = 8, PEN_BTN2 = 16;
