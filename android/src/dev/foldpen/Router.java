@@ -216,12 +216,12 @@ final class Router {
             float x = e.getHistoricalX(i, k), y = e.getHistoricalY(i, k);
             sendPen(flags, x / w, y / h, e.getHistoricalPressure(i, k),
                     e.getHistoricalAxisValue(MotionEvent.AXIS_TILT, i, k),
-                    e.getHistoricalAxisValue(MotionEvent.AXIS_ORIENTATION, i, k));
+                    e.getHistoricalAxisValue(MotionEvent.AXIS_ORIENTATION, i, k), e.getHistoricalEventTime(k));
             if (touching) host.ink(x, y, true);
         }
         float x = e.getX(i), y = e.getY(i);
         sendPen(flags, x / w, y / h, e.getPressure(i),
-                e.getAxisValue(MotionEvent.AXIS_TILT, i), e.getAxisValue(MotionEvent.AXIS_ORIENTATION, i));
+                e.getAxisValue(MotionEvent.AXIS_TILT, i), e.getAxisValue(MotionEvent.AXIS_ORIENTATION, i), e.getEventTime());
         if (touching) host.ink(x, y, true);
         else host.hover(x, y, true);
     }
@@ -229,7 +229,7 @@ final class Router {
     private void stylusUp(MotionEvent e, int i) {
         penTouching = false;
         int flags = PEN_IN_RANGE | stylusButtons(e, i);
-        sendPen(flags, e.getX(i) / w, e.getY(i) / h, 0, 0, 0);
+        sendPen(flags, e.getX(i) / w, e.getY(i) / h, 0, 0, 0, e.getEventTime());
         host.ink(e.getX(i), e.getY(i), false);
         penLastSeen = SystemClock.uptimeMillis();
         // stays in range while it hovers; leaves if no hover event follows
@@ -271,10 +271,18 @@ final class Router {
     }
 
     private void sendPen(int flags, float x, float y, float p, float tilt, float orient) {
+        sendPen(flags, x, y, p, tilt, orient, SystemClock.uptimeMillis());
+    }
+
+    /** `when` is the sample's own time (MotionEvent clock = uptimeMillis): the
+     *  daemon replays samples on this timeline, so Wi-Fi bursts come out
+     *  evenly spaced instead of merged into one point. */
+    private void sendPen(int flags, float x, float y, float p, float tilt, float orient, long when) {
         double t = Math.toDegrees(tilt);
-        ByteBuffer b = ByteBuffer.allocate(21);
+        ByteBuffer b = ByteBuffer.allocate(25);
         b.put((byte) flags).putFloat(x).putFloat(y).putFloat(p)
-                .putFloat((float) (t * Math.sin(orient))).putFloat((float) (-t * Math.cos(orient)));
+                .putFloat((float) (t * Math.sin(orient))).putFloat((float) (-t * Math.cos(orient)))
+                .putInt((int) when);
         link.send(Link.T_PEN, b.array());
     }
 
@@ -301,7 +309,7 @@ final class Router {
             if (atEdge(c)) { c.state = S.REJECTED; dbg(c, "rej:edge"); }
             else if (palmLike(c)) { markPalm(c); dbg(c, "rej:palm-size"); }
         }
-        c.buf.add(new float[]{x, y});
+        c.buf.add(new float[]{x, y, 0});
         if (maybeStartGesture(t)) return;
         if (c.state == S.PENDING && finger.equals("pen") && penFinger == null) maybeTwoTap(c, t);
         if (c.state == S.PENDING) {
@@ -336,7 +344,7 @@ final class Router {
             switch (c.state) {
                 case PENDING:
                     if (finger.equals("pen") && palmLike(c)) { markPalm(c); dbg(c, "rej:palm-grew"); break; }
-                    c.buf.add(new float[]{x, y});
+                    c.buf.add(new float[]{x, y, st - c.downT});
                     if (finger.equals("pen") && Math.hypot(x - c.x0, y - c.y0) > WRITE_MM * mm) claimPen(c);
                     break;
                 case ACTIVE:
@@ -346,13 +354,13 @@ final class Router {
                             markPalm(c);
                             dbg(c, "end:palm-grew");
                         } else {
-                            sendPen(PEN_IN_RANGE | PEN_TOUCH, x / w, y / h, FINGER_PEN_PRESSURE, 0, 0);
+                            sendPen(PEN_IN_RANGE | PEN_TOUCH, x / w, y / h, FINGER_PEN_PRESSURE, 0, 0, st);
                             host.ink(x, y, true);
                         }
                     } else touchDirty = true;
                     break;
                 case TWO:
-                    c.buf.add(new float[]{x, y});
+                    c.buf.add(new float[]{x, y, st - c.downT});
                     if (Math.hypot(x - c.x0, y - c.y0) > WRITE_MM * mm) {
                         // it is writing: no button tap after all, an ordinary
                         // stroke (its buffer intact), and LWW decides as usual
@@ -464,9 +472,9 @@ final class Router {
         dbg(c, "PEN");
         if (c.major > 0) majorEma = majorEma == 0 ? c.major : majorEma * 0.8f + c.major * 0.2f;
         float[] first = c.buf.get(0);
-        sendPen(PEN_IN_RANGE, first[0] / w, first[1] / h, 0, 0, 0);     // proximity in
+        sendPen(PEN_IN_RANGE, first[0] / w, first[1] / h, 0, 0, 0, c.downT);     // proximity in
         for (float[] s : c.buf) {
-            sendPen(PEN_IN_RANGE | PEN_TOUCH, s[0] / w, s[1] / h, FINGER_PEN_PRESSURE, 0, 0);
+            sendPen(PEN_IN_RANGE | PEN_TOUCH, s[0] / w, s[1] / h, FINGER_PEN_PRESSURE, 0, 0, c.downT + (long) s[2]);
             host.ink(s[0], s[1], true);
         }
         c.buf.clear();

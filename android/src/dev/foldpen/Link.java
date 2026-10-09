@@ -52,6 +52,7 @@ final class Link {
     private Thread connector, beacon, sender;
     private DatagramSocket beaconSocket;
     private WifiManager.MulticastLock lock;
+    private WifiManager.WifiLock lowLatency;
     volatile int viewW, viewH;
 
     Link(Context ctx, Listener listener) {
@@ -71,7 +72,12 @@ final class Link {
             WifiManager wm = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             lock = wm.createMulticastLock("foldpen");
             lock.acquire();
-        } catch (Exception ignored) { lock = null; }
+            // Wi-Fi power save let the radio doze between packets: samples
+            // queued and arrived in bursts with stalls of up to ~300 ms.
+            // Held only while the app is in the foreground (start/stop).
+            lowLatency = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "foldpen");
+            lowLatency.acquire();
+        } catch (Exception ignored) { }
         connector = new Thread(this::connectLoop, "foldpen-connect");
         beacon = new Thread(this::beaconLoop, "foldpen-beacon");
         sender = new Thread(this::sendLoop, "foldpen-send");
@@ -88,6 +94,7 @@ final class Link {
         if (b != null) b.close();
         for (Thread t : new Thread[]{connector, beacon, sender}) if (t != null) t.interrupt();
         if (lock != null && lock.isHeld()) lock.release();
+        if (lowLatency != null && lowLatency.isHeld()) lowLatency.release();
     }
 
     /** Drop the current connection; the connector immediately tries again. */

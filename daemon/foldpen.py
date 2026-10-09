@@ -29,6 +29,7 @@ Wire format, both directions: [u8 type][u32 length, big endian][payload].
 
 import argparse
 import asyncio
+import collections
 import hashlib
 import json
 import os
@@ -70,6 +71,19 @@ TIP_FLOOR = 0.06
 # (GTK4) as the pen leaving while pressed -- a cancelled stroke, discarded on
 # lift -- so proximity-out follows the tip-up by as much.
 PROX_LEAD = 0.03
+# The phone sends a finger-pen stroke's first ~60-200 ms in one burst (held
+# until it qualified as writing). Toolkits merge motion that arrives in one
+# frame, so the burst collapsed and the line began where it ended, behind
+# where the stroke really started. Held samples are replayed this far apart
+# instead, a frame's worth at a time, and live ones queue behind them.
+PEN_PACE = 0.004
+# Pen samples carry the phone's own timestamp and are replayed on that
+# timeline: due = phone time + clock offset (the smallest transit seen lately)
+# + PEN_JITTER. adb-over-Wi-Fi delivered ~1 in 4 samples in bursts, which
+# toolkits merged into one point -- curves (digits!) came out as polylines.
+# A late sample (a stroke's held start) replays at CATCHUP x speed instead.
+PEN_JITTER = 0.012
+CATCHUP = 2.0
 
 STYLUS_NAME = "foldpen-stylus"
 TOUCH_NAME = "foldpen-touch"
@@ -289,6 +303,10 @@ class Daemon:
         self.frame_wake = asyncio.Event()
         self.pen_q = None           # samples held behind a fresh proximity-in
         self.prox_out = None        # pending proximity-out after a tip-up
+        self.pen_line = collections.deque()      # (phone s, event) awaiting playout
+        self.pen_timer = None
+        self.transit = collections.deque()       # (arrival, arrival - phone s)
+        self.last_play = None                    # (phone s, local s) of the last played
         self.refresh_monitors()
 
     # geometry ----------------------------------------------------------------
@@ -486,6 +504,10 @@ class Daemon:
             if self.client and self.client[1] is writer:
                 self.client = None
                 self.pen_q = None
+                self.pen_line.clear()
+                if self.pen_timer:
+                    self.pen_timer.cancel()
+                    self.pen_timer = None
                 if self.prox_out:
                     self.prox_out.cancel()
                     self.prox_out = None
@@ -510,10 +532,10 @@ class Daemon:
 
     def handle(self, t, p):
         if t == T_PEN:
-            flags, u, v, pr, tx, ty = struct.unpack(">Bfffff", p)
+            flags, u, v, pr, tx, ty, ts = struct.unpack(">BfffffI", p)
             if self.mon:
                 x, y = self.to_abs(u, v)
-                self.pen_input((flags, x, y, pr, int(tx), int(ty)))
+                self.pen_receive(ts / 1000.0, (flags, x, y, pr, int(tx), int(ty)))
             self.last_input = time.monotonic()
         elif t == T_TOUCH:
             n = p[0]
@@ -534,6 +556,35 @@ class Daemon:
                              m.get("cx", 0.5), m.get("cy", 0.5))
         elif t == T_VIEW:
             self.set_view(json.loads(p))
+
+    def pen_receive(self, ts, ev):
+        now = time.monotonic()
+        tr = self.transit
+        tr.append((now, now - ts))
+        while tr and now - tr[0][0] > 3.0:
+            tr.popleft()
+        self.pen_line.append((ts, ev))
+        self.pen_pump()
+
+    def pen_pump(self):
+        """Play queued samples out at their phone timing (see PEN_JITTER)."""
+        if self.pen_timer:
+            self.pen_timer.cancel()
+            self.pen_timer = None
+        offset = min(d for _, d in self.transit) if self.transit else 0.0
+        while self.pen_line:
+            ts, ev = self.pen_line[0]
+            now = time.monotonic()
+            due = ts + offset + PEN_JITTER
+            lp = self.last_play
+            if lp and 0 <= ts - lp[0] < 0.25:          # same stroke: keep the spacing
+                due = max(due, lp[1] + (ts - lp[0]) / CATCHUP)
+            if due > now + 0.0005:
+                self.pen_timer = asyncio.get_running_loop().call_later(due - now, self.pen_pump)
+                return
+            self.pen_line.popleft()
+            self.last_play = (ts, max(now, due))
+            self.pen_input(ev)
 
     def pen_input(self, ev):
         """Pen samples to the device, spacing proximity from the tip at both
@@ -560,9 +611,17 @@ class Daemon:
             self.dev.pen_event(*ev)
 
     def flush_pen(self):
+        """Replay held samples PEN_PACE apart; anything arriving meanwhile
+        queues behind them."""
         q, self.pen_q = self.pen_q or [], None
-        for ev in q:
-            self.pen_input(ev)
+        if not q:
+            return
+        self.pen_input(q.pop(0))
+        if self.pen_q is not None:      # that sample started a new proximity
+            self.pen_q.extend(q)
+        elif q:
+            self.pen_q = q
+            asyncio.get_running_loop().call_later(PEN_PACE, self.flush_pen)
 
     # display forwarding ----------------------------------------------------------
     async def frame_loop(self, writer):
