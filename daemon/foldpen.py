@@ -65,7 +65,10 @@ TIP_FLOOR = 0.06
 # gets proximity-in alone and its samples held this long before the tip goes
 # down. libinput delivers both in order, but Hyprland/the client lose a tip-
 # down that lands in the same instant as proximity-in -- the start of the
-# stroke came out as hover. One or two compositor frames is enough.
+# stroke came out as hover. One or two compositor frames is enough. The same
+# holds at the end: tip-up and proximity-out in one instant reached Rnote
+# (GTK4) as the pen leaving while pressed -- a cancelled stroke, discarded on
+# lift -- so proximity-out follows the tip-up by as much.
 PROX_LEAD = 0.03
 
 STYLUS_NAME = "foldpen-stylus"
@@ -285,6 +288,7 @@ class Daemon:
         self.last_input = 0.0
         self.frame_wake = asyncio.Event()
         self.pen_q = None           # samples held behind a fresh proximity-in
+        self.prox_out = None        # pending proximity-out after a tip-up
         self.refresh_monitors()
 
     # geometry ----------------------------------------------------------------
@@ -482,6 +486,9 @@ class Daemon:
             if self.client and self.client[1] is writer:
                 self.client = None
                 self.pen_q = None
+                if self.prox_out:
+                    self.prox_out.cancel()
+                    self.prox_out = None
                 self.dev.release_all()
             writer.close()
 
@@ -506,15 +513,7 @@ class Daemon:
             flags, u, v, pr, tx, ty = struct.unpack(">Bfffff", p)
             if self.mon:
                 x, y = self.to_abs(u, v)
-                ev = (flags, x, y, pr, int(tx), int(ty))
-                if self.pen_q is not None:
-                    self.pen_q.append(ev)
-                elif flags & PEN_TOUCH and not self.dev.pen_state["range"]:
-                    self.dev.pen_event(flags & ~PEN_TOUCH, x, y, 0.0, int(tx), int(ty))
-                    self.pen_q = [ev]
-                    asyncio.get_running_loop().call_later(PROX_LEAD, self.flush_pen)
-                else:
-                    self.dev.pen_event(*ev)
+                self.pen_input((flags, x, y, pr, int(tx), int(ty)))
             self.last_input = time.monotonic()
         elif t == T_TOUCH:
             n = p[0]
@@ -536,10 +535,34 @@ class Daemon:
         elif t == T_VIEW:
             self.set_view(json.loads(p))
 
+    def pen_input(self, ev):
+        """Pen samples to the device, spacing proximity from the tip at both
+        ends of a stroke (PROX_LEAD)."""
+        flags, x, y, pr, tx, ty = ev
+        if self.pen_q is not None:
+            self.pen_q.append(ev)
+            return
+        if self.prox_out:
+            self.prox_out.cancel()
+            self.prox_out = None
+        st = self.dev.pen_state
+        loop = asyncio.get_running_loop()
+        if not flags & PEN_IN_RANGE:
+            if st["range"]:
+                if st["touch"]:
+                    self.dev.pen_event(PEN_IN_RANGE, x, y, 0.0, tx, ty)    # tip up, still near
+                self.prox_out = loop.call_later(PROX_LEAD, self.dev.pen_event, 0, x, y, 0.0, 0, 0)
+        elif flags & PEN_TOUCH and not st["range"]:
+            self.dev.pen_event(flags & ~PEN_TOUCH, x, y, 0.0, tx, ty)  # proximity in alone
+            self.pen_q = [ev]
+            loop.call_later(PROX_LEAD, self.flush_pen)
+        else:
+            self.dev.pen_event(*ev)
+
     def flush_pen(self):
         q, self.pen_q = self.pen_q or [], None
         for ev in q:
-            self.dev.pen_event(*ev)
+            self.pen_input(ev)
 
     # display forwarding ----------------------------------------------------------
     async def frame_loop(self, writer):
