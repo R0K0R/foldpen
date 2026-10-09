@@ -50,11 +50,13 @@ final class Router {
     // lifted before REST_MS without writing.
     // Strokes are buffered until they qualify and dropped if they don't:
     // shorter than BLIP_MS, idle for REST_MS before writing, or corrupted --
-    // a sample jumping JUMP_MM or a contact size changing by SIZE_JUMP x
-    // between samples (a palm merging / splitting). Corruption after a stroke
-    // went live ends it there.
+    // a sample jumping more than JUMP_MM at over JUMP_SPEED (mm/ms = m/s;
+    // faster than a hand writes, what a palm contact snapping does), or a
+    // contact size changing by SIZE_JUMP x AND SIZE_JUMP_MM (sizes are
+    // quantised: 0.1 -> 0.2 mm is not a palm). Corruption after a stroke went
+    // live ends it there.
     static final long REST_MS = 400, BLIP_MS = 50;
-    static final float WRITE_MM = 1.2f, JUMP_MM = 12, SIZE_JUMP = 2.0f;
+    static final float WRITE_MM = 1.2f, JUMP_MM = 8, JUMP_SPEED = 3, SIZE_JUMP = 2.0f, SIZE_JUMP_MM = 5;
     static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450;
     static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
     static final float SLOP_MM = 6, SWIPE_MM = 18, EDGE_MM = 2.5f;
@@ -71,12 +73,13 @@ final class Router {
         final long downT;
         final float x0, y0;
         float x, y, major, gx0, gy0, lastMajor;
+        long lastT;
         S state = S.PENDING;
         boolean palm, cancel;
         int slot = -1;
         final ArrayList<float[]> buf = new ArrayList<>();
         Contact(int id, long t, float x, float y, float major) {
-            this.id = id; downT = t; x0 = this.x = x; y0 = this.y = y; this.major = lastMajor = major;
+            this.id = id; downT = t; x0 = this.x = x; y0 = this.y = y; this.major = lastMajor = major; lastT = t;
         }
     }
 
@@ -313,9 +316,14 @@ final class Router {
             float x = cur ? e.getX(i) : e.getHistoricalX(i, k);
             float y = cur ? e.getY(i) : e.getHistoricalY(i, k);
             float maj = cur ? e.getTouchMajor(i) : e.getHistoricalTouchMajor(i, k);
-            boolean corrupt = finger.equals("pen") && (Math.hypot(x - c.x, y - c.y) > JUMP_MM * mm
-                    || (c.lastMajor > 0 && maj > 0 && (maj > c.lastMajor * SIZE_JUMP || maj * SIZE_JUMP < c.lastMajor)));
+            long st = cur ? e.getEventTime() : e.getHistoricalEventTime(k);
+            float jump = (float) Math.hypot(x - c.x, y - c.y) / mm;
+            boolean corrupt = finger.equals("pen") && (
+                    (jump > JUMP_MM && jump / Math.max(st - c.lastT, 1) > JUMP_SPEED)
+                    || (c.lastMajor > 0 && maj > 0 && Math.abs(maj - c.lastMajor) > SIZE_JUMP_MM * mm
+                        && (maj > c.lastMajor * SIZE_JUMP || maj * SIZE_JUMP < c.lastMajor)));
             c.lastMajor = maj;
+            c.lastT = st;
             c.x = x; c.y = y;
             c.major = Math.max(c.major, maj);
             if (corrupt && (c.state == S.PENDING || c == penFinger)) {

@@ -32,7 +32,7 @@ A dummy pen usually lands **after** the palm. The first contact down is therefor
 - **It must write.** A stroke qualifies by moving more than 1.2 mm.
 - **Too idle → dropped.** A contact that sits still for 400 ms before writing is a resting hand.
 - **Too short → dropped.** A contact lifted within 50 ms is a blip. One lifted later without moving is a tap.
-- **Corrupted → dropped.** So is a contact that jumps more than 12 mm between samples, or whose size doubles or halves (a palm merging or splitting). If that happens after the stroke went live, the stroke ends there.
+- **Corrupted → dropped.** So is a contact that jumps more than 8 mm between samples at over 3 m/s (a palm contact snapping, not a hand writing), or whose size changes by both 2× and 5 mm (a palm merging or splitting; on the Fold sizes read around 0.1 mm, so in practice this one never fires). If that happens after the stroke went live, the stroke ends there.
 - **Size.** A contact is a palm if it is larger than 12 mm, or larger than twice the running average of contacts that became the pen, capped at 22 mm. A contact that grows into a palm mid-stroke ends the stroke. While a size-detected palm is down, and for 350 ms after it lifts, new contacts next to it or below it are hand.
 - **Edges.** A contact starting within 2.5 mm of the screen edge (a gripping thumb) is ignored.
 - **The S Pen wins.** While the S Pen is near the screen, and for 400 ms after it leaves, fingers are ignored. Android's own palm cancellation (`FLAG_CANCELED`) is honoured.
