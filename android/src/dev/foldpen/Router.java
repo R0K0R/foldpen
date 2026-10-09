@@ -1,0 +1,623 @@
+package dev.foldpen;
+
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
+import android.util.SparseArray;
+import android.view.MotionEvent;
+
+import org.json.JSONObject;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+
+/**
+ * Turns MotionEvents into pen / touch messages, and recognises the control
+ * gestures. Everything is decided per pointer by tool type:
+ *
+ *  S Pen (TOOL_TYPE_STYLUS / ERASER): sent at once, every historical sample,
+ *  never delayed. While it is near the screen, fingers are ignored.
+ *
+ *  Fingers: held back first (buffered, not dropped), long enough to see
+ *  whether they are a palm or the start of a 3-finger gesture. Then:
+ *    finger mode "pen"   -> one contact is the pen (a dummy stylus): the one
+ *                           that starts WRITING. A pen that is moving keeps
+ *                           it (active-write-win); otherwise the newest writer
+ *                           takes it (last-writer-wins), because the pen tip
+ *                           lands after the palm. Still contacts are hand.
+ *    finger mode "touch" -> every finger is a touchscreen contact.
+ *
+ *  Gestures, always three fingers, so they work without looking:
+ *    tap               toggle display forwarding
+ *    hold (still)      toggle edit mode (move / resize the input rectangle)
+ *    swipe sideways    toggle finger mode (pen <-> touch)
+ *  In edit mode one finger drags the rectangle and two pinch-resize it.
+ */
+final class Router {
+    interface Host {
+        void toggle(String what);
+        void ink(float x, float y, boolean down);
+        void hover(float x, float y, boolean inRange);
+    }
+
+    // timing (ms) and distances (mm)
+    static final long TOUCH_HOLD_MS = 55, GESTURE_SPREAD_MS = 220;
+    // finger = pen: a contact is the pen once it WRITES (moves WRITE_MM); one
+    // that sits still for REST_MS first is a resting hand. A tap is a contact
+    // lifted before REST_MS without writing.
+    static final long REST_MS = 400, ACTIVE_WRITE_MS = 120;
+    static final float WRITE_MM = 1.2f, ACTIVE_MOVE_MM = 0.4f;
+    static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450;
+    static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
+    static final float SLOP_MM = 6, SWIPE_MM = 18, EDGE_MM = 2.5f;
+    static final float PALM_MM = 12, PALM_MAX_MM = 22, PALM_NEAR_MM = 22, PALM_SIDE_MM = 45;
+    static final float FINGER_PEN_PRESSURE = 0.5f;
+
+    static final int PEN_IN_RANGE = 1, PEN_TOUCH = 2, PEN_BTN1 = 4, PEN_ERASER = 8, PEN_BTN2 = 16;
+    static final int TOUCH_DOWN = 1, TOUCH_PALM = 2;
+
+    enum S { PENDING, ACTIVE, REJECTED, GESTURE, EDIT }
+
+    static final class Contact {
+        final int id;
+        final long downT;
+        final float x0, y0;
+        float x, y, major, gx0, gy0, mx, my;
+        long movedT;
+        S state = S.PENDING;
+        boolean palm, cancel;
+        int slot = -1;
+        final ArrayList<float[]> buf = new ArrayList<>();
+        Contact(int id, long t, float x, float y, float major) {
+            this.id = id; downT = t; x0 = this.x = mx = x; y0 = this.y = my = y; this.major = major; movedT = t;
+        }
+    }
+
+    private final Link link;
+    private final Host host;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private float w = 1, h = 1, mm = 10;
+
+    String finger = "pen";
+    boolean edit;
+
+    // stylus
+    private boolean penInRange, penTouching;
+    private long penLastSeen = -10_000;
+    private final Runnable proxOut = this::proximityOut;
+
+    // fingers
+    private final SparseArray<Contact> contacts = new SparseArray<>();
+    private Contact penFinger;
+    private final ArrayList<float[]> palms = new ArrayList<>();   // x, y, radius, endTime(0 = down)
+    private float majorEma;
+    private final boolean[] slots = new boolean[10];
+    private final ArrayList<Contact> cancelled = new ArrayList<>();
+    private boolean touchDirty;
+
+    // gesture
+    private boolean gesture, gestureFired;
+    private long gestureT0;
+    private float gestureMax;
+    private final Runnable gestureHold = this::gestureHeld;
+
+    private void gestureHeld() {
+        if (gesture && !gestureFired && gestureMax < SLOP_MM * mm) fire("edit");
+    }
+
+    // edit
+    private int editKey;
+    private float editCx, editCy, editSpread;
+    private float accDx, accDy, accScale = 1, accCx = .5f, accCy = .5f;
+    private long lastEditSend;
+
+    private final Runnable tick = this::activateReady;
+
+    Router(Link link, Host host) { this.link = link; this.host = host; }
+
+    void setSize(float w, float h, float dpi) {
+        this.w = Math.max(w, 1); this.h = Math.max(h, 1); this.mm = dpi / 25.4f;
+    }
+
+    /** State from the daemon. Mode changes drop whatever is in flight. */
+    void setModes(String finger, boolean edit) {
+        boolean changed = !finger.equals(this.finger) || edit != this.edit;
+        this.finger = finger;
+        this.edit = edit;
+        if (!changed) return;
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact c = contacts.valueAt(i);
+            if (c.state == S.ACTIVE || c.state == S.PENDING) cancelContact(c);
+            if (c.state != S.GESTURE) c.state = S.REJECTED;
+        }
+        if (edit && penTouching) liftPen();
+        flushTouch();
+    }
+
+    // ================================================================ events
+
+    void onTouch(MotionEvent e) {
+        int am = e.getActionMasked(), ai = e.getActionIndex();
+        boolean canceled = am == MotionEvent.ACTION_CANCEL
+                || (Build.VERSION.SDK_INT >= 33 && (e.getFlags() & MotionEvent.FLAG_CANCELED) != 0);
+        long now = e.getEventTime();
+
+        // moves first (historical samples included), then the pointer that changed
+        for (int i = 0; i < e.getPointerCount(); i++) {
+            boolean isAction = i == ai && am != MotionEvent.ACTION_MOVE;
+            if (isStylus(e, i)) {
+                if (edit) continue;
+                if (!isAction || am == MotionEvent.ACTION_DOWN || am == MotionEvent.ACTION_POINTER_DOWN) {
+                    stylusSamples(e, i, true);
+                }
+            } else if (!isAction) {
+                Contact c = contacts.get(e.getPointerId(i));
+                if (c != null) fingerMove(e, i, c);
+            }
+        }
+        if (am == MotionEvent.ACTION_DOWN || am == MotionEvent.ACTION_POINTER_DOWN) {
+            if (!isStylus(e, ai)) fingerDown(e, ai, now);
+        } else if (am == MotionEvent.ACTION_UP || am == MotionEvent.ACTION_POINTER_UP) {
+            if (isStylus(e, ai)) { if (!edit) stylusUp(e, ai); }
+            else fingerUp(e.getPointerId(ai), canceled);
+        } else if (am == MotionEvent.ACTION_CANCEL) {
+            for (int i = 0; i < e.getPointerCount(); i++) {
+                if (isStylus(e, i)) { if (!edit) liftPen(); }
+                else fingerUp(e.getPointerId(i), true);
+            }
+        }
+        if (edit) editUpdate(e, am, ai);
+        flushTouch();
+    }
+
+    void onHover(MotionEvent e) {
+        if (edit || !isStylus(e, 0)) return;
+        int am = e.getActionMasked();
+        if (am == MotionEvent.ACTION_HOVER_EXIT) {
+            // EXIT also precedes every touch-down; only leave proximity if no
+            // DOWN follows shortly.
+            handler.removeCallbacks(proxOut);
+            handler.postDelayed(proxOut, 150);
+            return;
+        }
+        stylusSamples(e, 0, false);
+    }
+
+    // ================================================================ stylus
+
+    private static boolean isStylus(MotionEvent e, int i) {
+        int t = e.getToolType(i);
+        return t == MotionEvent.TOOL_TYPE_STYLUS || t == MotionEvent.TOOL_TYPE_ERASER;
+    }
+
+    private void stylusSamples(MotionEvent e, int i, boolean touching) {
+        handler.removeCallbacks(proxOut);
+        penLastSeen = SystemClock.uptimeMillis();
+        if (penFinger != null) { endPenFinger(true); }
+        if (touching) rejectFingersForStylus();
+        penInRange = true;
+        penTouching = touching;
+        int flags = PEN_IN_RANGE | (touching ? PEN_TOUCH : 0) | stylusButtons(e, i);
+        for (int k = 0; k < e.getHistorySize(); k++) {
+            float x = e.getHistoricalX(i, k), y = e.getHistoricalY(i, k);
+            sendPen(flags, x / w, y / h, e.getHistoricalPressure(i, k),
+                    e.getHistoricalAxisValue(MotionEvent.AXIS_TILT, i, k),
+                    e.getHistoricalAxisValue(MotionEvent.AXIS_ORIENTATION, i, k));
+            if (touching) host.ink(x, y, true);
+        }
+        float x = e.getX(i), y = e.getY(i);
+        sendPen(flags, x / w, y / h, e.getPressure(i),
+                e.getAxisValue(MotionEvent.AXIS_TILT, i), e.getAxisValue(MotionEvent.AXIS_ORIENTATION, i));
+        if (touching) host.ink(x, y, true);
+        else host.hover(x, y, true);
+    }
+
+    private void stylusUp(MotionEvent e, int i) {
+        penTouching = false;
+        int flags = PEN_IN_RANGE | stylusButtons(e, i);
+        sendPen(flags, e.getX(i) / w, e.getY(i) / h, 0, 0, 0);
+        host.ink(e.getX(i), e.getY(i), false);
+        penLastSeen = SystemClock.uptimeMillis();
+        // stays in range while it hovers; leaves if no hover event follows
+        handler.removeCallbacks(proxOut);
+        handler.postDelayed(proxOut, 400);
+    }
+
+    private void proximityOut() {
+        if (!penInRange) return;
+        penInRange = false;
+        sendPen(0, 0, 0, 0, 0, 0);
+        host.hover(0, 0, false);
+    }
+
+    private void liftPen() {
+        if (!penInRange) return;
+        penTouching = false;
+        handler.removeCallbacks(proxOut);
+        proxOut.run();
+    }
+
+    private static int stylusButtons(MotionEvent e, int i) {
+        int b = e.getButtonState(), f = 0;
+        if ((b & (MotionEvent.BUTTON_STYLUS_PRIMARY | MotionEvent.BUTTON_SECONDARY)) != 0) f |= PEN_BTN1;
+        if ((b & (MotionEvent.BUTTON_STYLUS_SECONDARY | MotionEvent.BUTTON_TERTIARY)) != 0) f |= PEN_BTN2;
+        if (e.getToolType(i) == MotionEvent.TOOL_TYPE_ERASER) f |= PEN_ERASER;
+        return f;
+    }
+
+    private boolean stylusRecently() {
+        return penInRange || SystemClock.uptimeMillis() - penLastSeen < STYLUS_GRACE_MS;
+    }
+
+    private void rejectFingersForStylus() {
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact c = contacts.valueAt(i);
+            if (c.state == S.ACTIVE || c.state == S.PENDING) { cancelContact(c); c.state = S.REJECTED; }
+        }
+    }
+
+    private void sendPen(int flags, float x, float y, float p, float tilt, float orient) {
+        double t = Math.toDegrees(tilt);
+        ByteBuffer b = ByteBuffer.allocate(21);
+        b.put((byte) flags).putFloat(x).putFloat(y).putFloat(p)
+                .putFloat((float) (t * Math.sin(orient))).putFloat((float) (-t * Math.cos(orient)));
+        link.send(Link.T_PEN, b.array());
+    }
+
+    // ================================================================ fingers
+
+    private void fingerDown(MotionEvent e, int i, long t) {
+        float x = e.getX(i), y = e.getY(i);
+        Contact c = new Contact(e.getPointerId(i), t, x, y, e.getTouchMajor(i));
+        contacts.put(c.id, c);
+        if (gesture) { joinGesture(c); return; }
+        if (stylusRecently()) { c.state = S.REJECTED; return; }
+        if (edit) c.state = S.EDIT;
+        else if (finger.equals("pen")) {
+            if (atEdge(c)) c.state = S.REJECTED;
+            else if (palmLike(c)) markPalm(c);
+        }
+        c.buf.add(new float[]{x, y});
+        if (maybeStartGesture(t)) return;
+        if (c.state == S.PENDING) {
+            handler.removeCallbacks(tick);
+            handler.postDelayed(tick, holdMs());
+        }
+    }
+
+    private void fingerMove(MotionEvent e, int i, Contact c) {
+        for (int k = 0; k <= e.getHistorySize(); k++) {
+            boolean cur = k == e.getHistorySize();
+            float x = cur ? e.getX(i) : e.getHistoricalX(i, k);
+            float y = cur ? e.getY(i) : e.getHistoricalY(i, k);
+            float maj = cur ? e.getTouchMajor(i) : e.getHistoricalTouchMajor(i, k);
+            c.x = x; c.y = y;
+            c.major = Math.max(c.major, maj);
+            if (Math.hypot(x - c.mx, y - c.my) > ACTIVE_MOVE_MM * mm) {
+                c.mx = x; c.my = y; c.movedT = SystemClock.uptimeMillis();
+            }
+            switch (c.state) {
+                case PENDING:
+                    if (finger.equals("pen") && palmLike(c)) { markPalm(c); break; }
+                    c.buf.add(new float[]{x, y});
+                    if (finger.equals("pen") && Math.hypot(x - c.x0, y - c.y0) > WRITE_MM * mm) claimPen(c);
+                    break;
+                case ACTIVE:
+                    if (c == penFinger) {
+                        if (palmLike(c)) {      // a palm rolled onto the "pen"
+                            endPenFinger(false);
+                            markPalm(c);
+                        } else {
+                            sendPen(PEN_IN_RANGE | PEN_TOUCH, x / w, y / h, FINGER_PEN_PRESSURE, 0, 0);
+                            host.ink(x, y, true);
+                        }
+                    } else touchDirty = true;
+                    break;
+                case GESTURE:
+                    gestureMove();
+                    break;
+                default:
+                    if (c.palm) updatePalm(c);
+            }
+        }
+    }
+
+    private void fingerUp(int id, boolean canceled) {
+        Contact c = contacts.get(id);
+        if (c == null) return;
+        if (c.state == S.PENDING && !canceled) {
+            // A quick tap, shorter than the hold window: decide now, and let
+            // the daemon see it down before it goes up. In pen mode only while
+            // nothing is writing -- a tap during a stroke is the hand bouncing.
+            if (!finger.equals("pen")) activate(c);
+            else if (penFinger == null && SystemClock.uptimeMillis() - c.downT < REST_MS) claimPen(c);
+            flushTouch();
+        }
+        contacts.remove(id);
+        if (c.state == S.ACTIVE) {
+            if (c == penFinger) endPenFinger(false);
+            else {
+                if (canceled) { c.cancel = true; cancelled.add(c); }
+                else freeSlot(c);
+                touchDirty = true;
+            }
+        }
+        if (c.palm) endPalm(c);
+        if (c.state == S.GESTURE) gestureUp();
+    }
+
+    private long holdMs() { return finger.equals("pen") ? REST_MS : TOUCH_HOLD_MS; }
+
+    /** Touch mode: pending contacts that outlast the hold window become
+     *  touches. Pen mode: ones that sat still that long are a resting hand. */
+    private void activateReady() {
+        long now = SystemClock.uptimeMillis();
+        long next = Long.MAX_VALUE;
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact c = contacts.valueAt(i);
+            if (c.state != S.PENDING) continue;
+            long due = c.downT + holdMs();
+            if (due > now) { next = Math.min(next, due); continue; }
+            if (finger.equals("pen")) { c.state = S.REJECTED; c.buf.clear(); }
+            else activate(c);
+        }
+        if (next != Long.MAX_VALUE) handler.postDelayed(tick, Math.max(1, next - now));
+        flushTouch();
+    }
+
+    /** Pen mode arbitration, for a contact that has started writing.
+     *  Active-write-win: a pen that is moving right now keeps the pen.
+     *  Otherwise last-writer-wins: the newer contact takes it, and the older
+     *  one -- the palm the pen usually lands after -- is set aside for good. */
+    private void claimPen(Contact c) {
+        Contact cur = penFinger;
+        if (cur != null) {
+            boolean curWriting = SystemClock.uptimeMillis() - cur.movedT < ACTIVE_WRITE_MS;
+            if (curWriting || c.downT < cur.downT) {
+                c.state = S.REJECTED;
+                c.buf.clear();
+                return;
+            }
+            endPenFinger(false);
+        }
+        activate(c);
+    }
+
+    private void activate(Contact c) {
+        if (finger.equals("touch")) {
+            c.slot = takeSlot();
+            if (c.slot < 0) { c.state = S.REJECTED; return; }
+            c.state = S.ACTIVE;
+            touchDirty = true;
+            return;
+        }
+        // finger = pen (claimPen has settled who): not a palm
+        if (penFinger != null || stylusRecently() || palmLike(c) || nearPalm(c)) {
+            if (palmLike(c)) markPalm(c); else c.state = S.REJECTED;
+            c.buf.clear();
+            return;
+        }
+        // whatever else is down and older is the hand holding the pen
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact o = contacts.valueAt(i);
+            if (o != c && o.state == S.PENDING && o.downT <= c.downT) { o.state = S.REJECTED; o.buf.clear(); }
+        }
+        c.state = S.ACTIVE;
+        penFinger = c;
+        if (c.major > 0) majorEma = majorEma == 0 ? c.major : majorEma * 0.8f + c.major * 0.2f;
+        float[] first = c.buf.get(0);
+        sendPen(PEN_IN_RANGE, first[0] / w, first[1] / h, 0, 0, 0);     // proximity in
+        for (float[] s : c.buf) {
+            sendPen(PEN_IN_RANGE | PEN_TOUCH, s[0] / w, s[1] / h, FINGER_PEN_PRESSURE, 0, 0);
+            host.ink(s[0], s[1], true);
+        }
+        c.buf.clear();
+    }
+
+    private void endPenFinger(boolean takenOver) {
+        Contact c = penFinger;
+        if (c == null) return;
+        penFinger = null;
+        if (!takenOver) host.ink(c.x, c.y, false);
+        sendPen(0, c.x / w, c.y / h, 0, 0, 0);   // lift + proximity out
+        if (contacts.get(c.id) == c) c.state = S.REJECTED;
+    }
+
+    private void cancelContact(Contact c) {
+        if (c == penFinger) endPenFinger(false);
+        else if (c.state == S.ACTIVE && c.slot >= 0) { c.cancel = true; cancelled.add(c); touchDirty = true; }
+        c.buf.clear();
+    }
+
+    // ---------------------------------------------------------------- palm rejection
+
+    /** Bigger than any pen tip: an absolute floor, raised by what this pen's
+     *  contacts have actually measured (a fingertip-sized dummy pen and a
+     *  fine-tipped one end up with different thresholds). */
+    private float palmThreshold() {
+        return Math.min(Math.max(PALM_MM * mm, majorEma * 2.0f), PALM_MAX_MM * mm);
+    }
+
+    private boolean palmLike(Contact c) {
+        return c.major > 0 && c.major > palmThreshold();
+    }
+
+    private boolean atEdge(Contact c) {
+        float m = EDGE_MM * mm;
+        return c.x0 < m || c.y0 < m || c.x0 > w - m || c.y0 > h - m;
+    }
+
+    private void markPalm(Contact c) {
+        if (c == penFinger) endPenFinger(false);
+        c.state = S.REJECTED;
+        if (!c.palm) { c.palm = true; palms.add(new float[]{c.x, c.y, c.major / 2, 0, c.id}); }
+        updatePalm(c);
+    }
+
+    private void updatePalm(Contact c) {
+        for (float[] p : palms) if (p[3] == 0 && p[4] == c.id) { p[0] = c.x; p[1] = c.y; p[2] = Math.max(p[2], c.major / 2); }
+    }
+
+    private void endPalm(Contact c) {
+        for (float[] p : palms) if (p[3] == 0 && p[4] == c.id) p[3] = SystemClock.uptimeMillis();
+    }
+
+    /** With a palm resting (or just lifted), the pen tip is above it. Anything
+     *  level with or below the palm, or right next to it, is more hand. */
+    private boolean nearPalm(Contact c) {
+        long now = SystemClock.uptimeMillis();
+        for (int i = palms.size() - 1; i >= 0; i--) {
+            float[] p = palms.get(i);
+            if (p[3] != 0 && now - p[3] > PALM_MEMORY_MS) { palms.remove(i); continue; }
+            float dx = c.x0 - p[0], dy = c.y0 - p[1];
+            if (Math.hypot(dx, dy) < Math.max(p[2] * 1.5f, PALM_NEAR_MM * mm)) return true;
+            if (dy > -p[2] && Math.abs(dx) < PALM_SIDE_MM * mm) return true;
+        }
+        return false;
+    }
+
+    // ---------------------------------------------------------------- touch frames
+
+    private int takeSlot() {
+        for (int i = 0; i < slots.length; i++) if (!slots[i]) { slots[i] = true; return i; }
+        return -1;
+    }
+
+    private void freeSlot(Contact c) {
+        if (c.slot >= 0) slots[c.slot] = false;
+        c.slot = -1;
+    }
+
+    private void flushTouch() {
+        if (!touchDirty) return;
+        touchDirty = false;
+        ArrayList<Contact> live = new ArrayList<>();
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact c = contacts.valueAt(i);
+            if (c.state == S.ACTIVE && c != penFinger && c.slot >= 0 && !c.cancel) live.add(c);
+        }
+        live.addAll(cancelled);
+        ByteBuffer b = ByteBuffer.allocate(1 + live.size() * 10);
+        b.put((byte) live.size());
+        for (Contact c : live) {
+            b.put((byte) c.slot).put((byte) (c.cancel ? TOUCH_PALM : TOUCH_DOWN))
+                    .putFloat(c.x / w).putFloat(c.y / h);
+        }
+        link.send(Link.T_TOUCH, b.array());
+        for (Contact c : cancelled) {
+            freeSlot(c);
+            if (contacts.get(c.id) == c) c.state = S.REJECTED;
+        }
+        cancelled.clear();
+    }
+
+    // ================================================================ gestures
+
+    private boolean maybeStartGesture(long now) {
+        int n = 0;
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact c = contacts.valueAt(i);
+            if (c.state != S.REJECTED && now - c.downT <= GESTURE_SPREAD_MS) n++;
+        }
+        if (n < 3) return false;
+        gesture = true;
+        gestureFired = false;
+        gestureMax = 0;
+        gestureT0 = now;
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact c = contacts.valueAt(i);
+            if (c.state != S.REJECTED && now - c.downT <= GESTURE_SPREAD_MS) {
+                cancelContact(c);
+                joinGesture(c);
+            }
+        }
+        handler.removeCallbacks(tick);
+        handler.postDelayed(gestureHold, GESTURE_HOLD_MS);
+        return true;
+    }
+
+    private void joinGesture(Contact c) {
+        c.state = S.GESTURE;
+        c.gx0 = c.x;
+        c.gy0 = c.y;
+    }
+
+    private void gestureMove() {
+        float sx = 0, sy = 0;
+        int n = 0;
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact c = contacts.valueAt(i);
+            if (c.state != S.GESTURE) continue;
+            sx += c.x - c.gx0; sy += c.y - c.gy0; n++;
+        }
+        if (n == 0) return;
+        float dx = sx / n, dy = sy / n;
+        gestureMax = Math.max(gestureMax, (float) Math.hypot(dx, dy));
+        if (gestureFired) return;
+        if (Math.abs(dx) > SWIPE_MM * mm && Math.abs(dx) > 1.5f * Math.abs(dy)) fire("finger");
+        else if (Math.abs(dy) > SWIPE_MM * mm) gestureFired = true;   // reserved, swallowed
+    }
+
+    private void gestureUp() {
+        for (int i = 0; i < contacts.size(); i++) if (contacts.valueAt(i).state == S.GESTURE) return;
+        handler.removeCallbacks(gestureHold);
+        if (!gestureFired && gestureMax < SLOP_MM * mm
+                && SystemClock.uptimeMillis() - gestureT0 < GESTURE_TAP_MS) fire("display");
+        gesture = false;
+    }
+
+    private void fire(String what) {
+        gestureFired = true;
+        host.toggle(what);
+    }
+
+    // ================================================================ edit mode
+
+    /** The rectangle as an object under the fingers: it follows them, and
+     *  grows as they spread. Coalesced to one message per ~16 ms. */
+    private void editUpdate(MotionEvent e, int am, int ai) {
+        float cx = 0, cy = 0;
+        int n = 0, key = 17;
+        for (int i = 0; i < e.getPointerCount(); i++) {
+            boolean leaving = i == ai && (am == MotionEvent.ACTION_UP || am == MotionEvent.ACTION_POINTER_UP
+                    || am == MotionEvent.ACTION_CANCEL);
+            if (leaving) continue;
+            Contact c = contacts.get(e.getPointerId(i));
+            if (!isStylus(e, i) && (c == null || c.state != S.EDIT)) continue;
+            cx += e.getX(i); cy += e.getY(i); n++;
+            key = key * 31 + e.getPointerId(i);
+        }
+        if (n == 0) { editKey = 0; sendEdit(true); return; }
+        cx /= n; cy /= n;
+        float spread = 0;
+        for (int i = 0; i < e.getPointerCount(); i++) {
+            Contact c = contacts.get(e.getPointerId(i));
+            if (!isStylus(e, i) && (c == null || c.state != S.EDIT)) continue;
+            spread += (float) Math.hypot(e.getX(i) - cx, e.getY(i) - cy);
+        }
+        spread /= n;
+        if (key == editKey) {
+            accDx += (cx - editCx) / w;
+            accDy += (cy - editCy) / w;
+            if (n >= 2 && editSpread > mm && spread > mm) accScale *= spread / editSpread;
+            accCx = cx / w; accCy = cy / h;
+        }
+        editKey = key; editCx = cx; editCy = cy; editSpread = spread;
+        sendEdit(false);
+    }
+
+    private void sendEdit(boolean force) {
+        long now = SystemClock.uptimeMillis();
+        if (accDx == 0 && accDy == 0 && accScale == 1) return;
+        if (!force && now - lastEditSend < 16) return;
+        lastEditSend = now;
+        try {
+            link.sendJson(Link.T_CMD, new JSONObject().put("cmd", "rect")
+                    .put("dx", accDx).put("dy", accDy).put("scale", accScale)
+                    .put("cx", accCx).put("cy", accCy));
+        } catch (Exception ignored) { }
+        accDx = accDy = 0;
+        accScale = 1;
+    }
+}
