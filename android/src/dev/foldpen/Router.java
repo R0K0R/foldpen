@@ -71,6 +71,12 @@ final class Router {
     // Area limit likewise: pen <= 5 px^2, fingertip 8-20, palm edge 35+.
     static final float PALM_MM = 0.45f, PALM_AREA_MM2 = 0.116f, PALM_EMA_X = 3, PALM_MAX_MM = 22, PALM_NEAR_MM = 15;
     static final float FINGER_PEN_PRESSURE = 0.5f;
+    // With the writing hand resting on the screen, the capacitive pen held in
+    // that hand reads 7-10 px instead of 1-2.5 (measured), so absolute size
+    // stops meaning anything. While a big palm (BIG_PX+) is down, a contact is
+    // judged against it instead: palm if within BLOB_NEAR_MM of it or at least
+    // BLOB_FRACTION of its size, otherwise the pen.
+    static final float BIG_PX = 20, BLOB_NEAR_MM = 25, BLOB_FRACTION = 0.4f;
 
     static final int PEN_IN_RANGE = 1, PEN_TOUCH = 2, PEN_BTN1 = 4, PEN_ERASER = 8, PEN_BTN2 = 16;
     static final int TOUCH_DOWN = 1, TOUCH_PALM = 2;
@@ -341,6 +347,10 @@ final class Router {
             // only a clearly palm-sized contact is rejected on landing: a
             // fingertip (3.4-5.9 px) is past the calibrated palm limit but may
             // be part of a gesture; decide() judges it after the hold window
+            else if (c.major >= BIG_PX) { markPalm(c); dbg(c, "rej:palm-size"); }
+            else if (bigPalm() != null) {
+                if (byPalm(c, bigPalm())) { markPalm(c); dbg(c, "rej:by-palm"); }
+            }
             else if (c.major >= 2 * palmThreshold()) { markPalm(c); dbg(c, "rej:palm-size"); }
         }
         c.buf.add(new float[]{x, y, 0});
@@ -495,6 +505,12 @@ final class Router {
     /** The one decision per stroke (pen mode), from its window's maxima. */
     private void decide(Contact c) {
         if (c.state != S.PENDING) return;
+        float[] big = bigPalm();
+        if (big != null) {
+            if (byPalm(c, big)) { markPalm(c); dbg(c, "rej:by-palm"); }
+            else claimPen(c);
+            return;
+        }
         if (palmLike(c)) { markPalm(c); dbg(c, "rej:palm"); return; }
         if (nearPalm(c)) { c.state = S.REJECTED; c.buf.clear(); dbg(c, "rej:near-palm"); return; }
         claimPen(c);
@@ -586,7 +602,26 @@ final class Router {
     /** Mid-stroke: a pressed rubber tip flattens and grows, so a live stroke
      *  ends only past the pen's own calibrated maximum (or the palm limit). */
     private boolean grewIntoPalm(Contact c) {
+        float[] big = bigPalm();
+        if (big != null && big[4] != c.id) return c.major >= BLOB_FRACTION * big[2] * 2;
         return calGrowPx > 0 ? c.major >= calGrowPx : palmLike(c);
+    }
+
+    /** The largest palm of BIG_PX+ that is down or just lifted, or null.
+     *  Entries are {x, y, major/2, endTime, id}. */
+    private float[] bigPalm() {
+        long now = SystemClock.uptimeMillis();
+        float[] best = null;
+        for (float[] p : palms) {
+            if (p[2] * 2 < BIG_PX || (p[3] != 0 && now - p[3] > PALM_MEMORY_MS)) continue;
+            if (best == null || p[2] > best[2]) best = p;
+        }
+        return best;
+    }
+
+    private boolean byPalm(Contact c, float[] big) {
+        return Math.hypot(c.x0 - big[0], c.y0 - big[1]) < BLOB_NEAR_MM * mm
+                || c.major >= BLOB_FRACTION * big[2] * 2;
     }
 
     private boolean palmLike(Contact c) {
@@ -623,6 +658,7 @@ final class Router {
         for (int i = palms.size() - 1; i >= 0; i--) {
             float[] p = palms.get(i);
             if (p[3] != 0 && now - p[3] > PALM_MEMORY_MS) { palms.remove(i); continue; }
+            if (p[2] * 2 < BIG_PX) continue;      // a fingertip-sized "palm" vetoes nothing
             float dx = c.x0 - p[0], dy = c.y0 - p[1];
             if (Math.hypot(dx, dy) < PALM_NEAR_MM * mm) return true;
         }
