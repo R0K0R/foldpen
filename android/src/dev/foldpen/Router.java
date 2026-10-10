@@ -891,10 +891,12 @@ final class Router {
         gestureT0 = now;
         for (int i = 0; i < contacts.size(); i++) {
             Contact c = contacts.valueAt(i);
-            if (c.state != S.REJECTED && !palmLike(c) && now - c.downT <= GESTURE_SPREAD_MS) {
-                cancelContact(c);
-                joinGesture(c);
-            }
+            // the three that passed the check above, whatever their size: a
+            // pen-calibrated palm check here (fingertips are past it) left a
+            // gesture with no fingers -- nothing ended it, so its hold timer
+            // always fired "edit" and every touch meanwhile was swallowed
+            cancelContact(c);
+            joinGesture(c);
         }
         handler.removeCallbacks(tick);
         handler.postDelayed(gestureHold, GESTURE_HOLD_MS);
