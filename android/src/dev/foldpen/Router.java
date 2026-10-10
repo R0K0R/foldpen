@@ -149,7 +149,7 @@ final class Router {
     // pen landing with a palm edge used to make a "two-finger tap" -- the
     // side button, Rnote's eraser -- out of a pen touch.
     static final long TWO_SPREAD_MS = 150, TWO_TAP_MS = 350;
-    static final float TWO_MIN_PX = 3.0f;
+    static final float TWO_MIN_PX = 3.0f, TWO_PALM_PX = 10;
     private Contact twoA, twoB;
 
     private boolean gesture, gestureFired;
@@ -433,7 +433,10 @@ final class Router {
                     } else touchDirty = true;
                     break;
                 case TWO:
-                    if (palmLike(c)) {          // not a two-finger tap: a hand
+                    // Fingertips are 3.4-6.9 px -- past the pen-calibrated palm
+                    // limit (~3.9) -- so only a clearly palm-sized contact
+                    // cancels the tap.
+                    if (c.major >= Math.max(2 * palmThreshold(), TWO_PALM_PX)) {   // a hand
                         for (Contact o : new Contact[]{twoA, twoB})
                             if (o != null && o != c && o.state == S.TWO) o.state = S.PENDING;
                         twoA = twoB = null;
