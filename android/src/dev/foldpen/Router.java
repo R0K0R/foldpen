@@ -61,7 +61,9 @@ final class Router {
     static final int DECIDE_SAMPLES = 6;
     static final long DECIDE_MS = 60, BLIP_MS = 50;
     static final float WRITE_MM = 1.2f, JUMP_MM = 8, JUMP_SPEED = 6, SIZE_JUMP = 2.0f, SIZE_JUMP_MM = 5;
-    static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450, GESTURE_GIVEUP_MS = 1500;
+    // A light tap lingers: a hold must be clearly longer than any tap, or the
+    // display toggle was read as edit mode.
+    static final long GESTURE_TAP_MS = 650, GESTURE_HOLD_MS = 800, GESTURE_GIVEUP_MS = 1800;
     static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
     static final float SLOP_MM = 6, SWIPE_MM = 18, EDGE_MM = 2.5f;
     // Contact size (getTouchMajor / px-per-mm). On the Fold these are not
@@ -953,6 +955,11 @@ final class Router {
 
     private void fire(String what) {
         gestureFired = true;
+        Log.d("foldpen-palm", "gesture " + what + " after " + (SystemClock.uptimeMillis() - gestureT0)
+                + "ms, moved " + (int) (gestureMax / mm) + "mm");
+        try { link.sendJson(Link.T_CMD, new JSONObject().put("cmd", "log").put("l", "gesture " + what
+                + " after " + (SystemClock.uptimeMillis() - gestureT0) + "ms, moved " + (int) (gestureMax / mm) + "mm")); }
+        catch (Exception ignored) { }
         host.toggle(what);
     }
 
