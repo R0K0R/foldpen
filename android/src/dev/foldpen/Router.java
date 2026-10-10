@@ -60,7 +60,7 @@ final class Router {
     // went live ends it there.
     static final int DECIDE_SAMPLES = 6;
     static final long DECIDE_MS = 60, BLIP_MS = 50;
-    static final float WRITE_MM = 1.2f, JUMP_MM = 8, JUMP_SPEED = 3, SIZE_JUMP = 2.0f, SIZE_JUMP_MM = 5;
+    static final float WRITE_MM = 1.2f, JUMP_MM = 8, JUMP_SPEED = 6, SIZE_JUMP = 2.0f, SIZE_JUMP_MM = 5;
     static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450, GESTURE_GIVEUP_MS = 1500;
     static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
     static final float SLOP_MM = 6, SWIPE_MM = 18, EDGE_MM = 2.5f;
@@ -84,6 +84,13 @@ final class Router {
     // fragment landing next to it inherits its samples and start time.
     static final long STITCH_MS = 100;
     static final float STITCH_MM = 10;
+    // Where the hand is. Right hand in landscape: the palm lies right of the
+    // pen, so the pen is the leftmost contact. A contact with another one
+    // more than AHEAD_MM further left is hand, whatever its
+    // size -- with the palm down, palm fragments are as small as the pen.
+    // HAND_X = -1: the pen is toward -x (right hand); +1 for a left hand.
+    static final float AHEAD_MM = 8;
+    float handX = -1;
 
     static final int PEN_IN_RANGE = 1, PEN_TOUCH = 2, PEN_BTN1 = 4, PEN_ERASER = 8, PEN_BTN2 = 16;
     static final int TOUCH_DOWN = 1, TOUCH_PALM = 2;
@@ -100,6 +107,7 @@ final class Router {
         float mEarly, aEarly;                      // maxima within DECIDE_MS: what decide() sees
         float major0;                              // at landing
         long lastT;
+        float speed;                               // mm/ms, smoothed: where a fragment may land
         S state = S.PENDING;
         boolean palm, cancel;
         int slot = -1;
@@ -367,7 +375,7 @@ final class Router {
             else if (c.major >= 2 * palmThreshold()) { markPalm(c); dbg(c, "rej:palm-size"); }
         }
         c.buf.add(new float[]{x, y, 0});
-        if (c.state == S.PENDING && finger.equals("pen") && !edit && stitch(c, t)) return;
+        if (c.state == S.PENDING && finger.equals("pen") && !edit && (handOver(c, t) || stitch(c, t))) return;
         if (maybeStartGesture(t)) return;
         if (c.state == S.PENDING && finger.equals("pen") && penFinger == null) maybeTwoTap(c, t);
         if (c.state == S.PENDING) {
@@ -389,6 +397,7 @@ final class Router {
                     || (c.lastMajor > 0 && maj > 0 && Math.abs(maj - c.lastMajor) > SIZE_JUMP_MM * mm
                         && (maj > c.lastMajor * SIZE_JUMP || maj * SIZE_JUMP < c.lastMajor)));
             c.lastMajor = maj;
+            if (st > c.lastT) c.speed = c.speed * 0.6f + 0.4f * jump / (st - c.lastT);
             c.lastT = st;
             c.path += jump * mm;
             c.minor = Math.max(c.minor, cur ? e.getTouchMinor(i) : e.getHistoricalTouchMinor(i, k));
@@ -525,17 +534,69 @@ final class Router {
     }
 
     /** The one decision per stroke (pen mode), from its window's maxima. */
+    /** The one decision per contact (pen mode). Position first: with other
+     *  contacts down, sizes say nothing (the pen held in a resting hand reads
+     *  palm-sized, palm fragments pen-sized), so the contact furthest toward
+     *  the pen side is the pen and anything behind it is hand. Size only
+     *  decides a contact that is alone, where the calibration holds. */
     private void decide(Contact c) {
         if (c.state != S.PENDING) return;
+        if (c.major >= BIG_PX) { markPalm(c); dbg(c, "rej:palm-size"); return; }
         float[] big = bigPalm();
-        if (big != null) {
-            if (byPalm(c, big)) { markPalm(c); dbg(c, "rej:by-palm"); }
-            else claimPen(c);
-            return;
+        if (big != null && Math.hypot(c.x0 - big[0], c.y0 - big[1]) < BLOB_NEAR_MM * mm) {
+            markPalm(c); dbg(c, "rej:by-palm"); return;
         }
-        if (palmLike(c)) { markPalm(c); dbg(c, "rej:palm"); return; }
-        if (nearPalm(c)) { c.state = S.REJECTED; c.buf.clear(); dbg(c, "rej:near-palm"); return; }
+        Contact a = ahead(c);
+        if (a != null) { c.state = S.REJECTED; c.buf.clear(); dbg(c, "rej:behind#" + a.id); return; }
+        if (othersDown(c) == 0 && palmLike(c)) { markPalm(c); dbg(c, "rej:palm"); return; }
         claimPen(c);
+    }
+
+    /** How far toward the pen side, in px: the leftmost touch is the pen
+     *  (right hand; handX = +1 makes it the rightmost for a left hand). */
+    private float penward(float x, float y) { return handX * x; }
+
+    /** Another contact down that lies AHEAD_MM further toward the pen side. */
+    private Contact ahead(Contact c) {
+        float sc = penward(c.x, c.y);
+        Contact best = null;
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact o = contacts.valueAt(i);
+            if (o == c || o.state == S.GESTURE || o.state == S.EDIT) continue;
+            if (penward(o.x, o.y) - sc > AHEAD_MM * mm && (best == null || penward(o.x, o.y) > penward(best.x, best.y))) best = o;
+        }
+        return best;
+    }
+
+    private int othersDown(Contact c) {
+        int n = 0;
+        for (int i = 0; i < contacts.size(); i++) if (contacts.valueAt(i) != c) n++;
+        return n;
+    }
+
+    /** Could c be where pen contact p went next? Within STITCH_MM plus the
+     *  distance p covers at its current speed in the time since its last
+     *  sample (with slack): a fast light stroke arrives as fragments far
+     *  apart. */
+    private boolean follows(Contact c, Contact p, long since) {
+        float reach = STITCH_MM * mm + 1.5f * p.speed * mm * (since + 16);
+        return Math.hypot(c.x0 - p.x, c.y0 - p.y) < reach;
+    }
+
+    /** A new fragment where the live pen is heading (the old one may still be
+     *  down): the stroke moves to it without a lift. */
+    private boolean handOver(Contact c, long t) {
+        Contact p = penFinger;
+        if (p == null || !follows(c, p, t - p.lastT)) return false;
+        c.state = S.ACTIVE;
+        penFinger = c;
+        c.speed = p.speed;
+        p.state = S.REJECTED;
+        c.buf.clear();
+        sendPen(PEN_IN_RANGE | PEN_TOUCH, c.x0 / w, c.y0 / h, FINGER_PEN_PRESSURE, 0, 0, t);
+        host.ink(c.x0, c.y0, true);
+        dbg(c, "handover#" + p.id);
+        return true;
     }
 
     /** Pen mode arbitration, for a stroke that has qualified: last-writer-
@@ -544,13 +605,13 @@ final class Router {
     private void claimPen(Contact c) {
         Contact cur = penFinger;
         if (cur != null) {
-            if (c.downT < cur.downT) {
-                dbg(c, "rej:older");
+            if (penward(c.x, c.y) - penward(cur.x, cur.y) <= AHEAD_MM * mm) {
+                dbg(c, "rej:pen-busy");
                 c.state = S.REJECTED;
                 c.buf.clear();
                 return;
             }
-            dbg(cur, "lost:newer");
+            dbg(cur, "lost:to#" + c.id);
             endPenFinger(false);
         }
         activate(c);
@@ -596,12 +657,12 @@ final class Router {
     private boolean stitch(Contact c, long t) {
         long now = SystemClock.uptimeMillis();
         Contact l = lifted;
-        if (l != null && now - liftedT < STITCH_MS && penFinger == null
-                && Math.hypot(c.x0 - l.x, c.y0 - l.y) < STITCH_MM * mm) {
+        if (l != null && now - liftedT < STITCH_MS && penFinger == null && follows(c, l, t - l.lastT)) {
             handler.removeCallbacks(penLift);
             lifted = null;
             c.state = S.ACTIVE;
             penFinger = c;
+            c.speed = l.speed;
             c.buf.clear();
             sendPen(PEN_IN_RANGE | PEN_TOUCH, c.x0 / w, c.y0 / h, FINGER_PEN_PRESSURE, 0, 0, t);
             host.ink(c.x0, c.y0, true);
