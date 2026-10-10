@@ -824,7 +824,8 @@ def fit_calibration(path):
 
     palm_px, pen_hi, palm_lo = limit("me")
     palm_area, pen_ahi, palm_alo = limit("ae")
-    grow = max(q([r["mx"] for r in pen], 0.99) * 1.15, palm_px)
+    # a pressed tip may flatten past anything recorded: keep a wide margin
+    grow = max(q([r["mx"] for r in pen], 0.99) * 1.6, palm_px * 1.5)
     report = {
         "pen_contacts": len(pen), "palm_contacts": len(palm),
         "pen_early_major_p97": round(pen_hi, 2), "palm_early_major_p25": round(palm_lo, 2),

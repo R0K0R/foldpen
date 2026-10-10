@@ -338,7 +338,10 @@ final class Router {
         if (edit) c.state = S.EDIT;
         else if (finger.equals("pen")) {
             if (atEdge(c)) { c.state = S.REJECTED; dbg(c, "rej:edge"); }
-            else if (palmLike(c)) { markPalm(c); dbg(c, "rej:palm-size"); }
+            // only a clearly palm-sized contact is rejected on landing: a
+            // fingertip (3.4-5.9 px) is past the calibrated palm limit but may
+            // be part of a gesture; decide() judges it after the hold window
+            else if (c.major >= 2 * palmThreshold()) { markPalm(c); dbg(c, "rej:palm-size"); }
         }
         c.buf.add(new float[]{x, y, 0});
         if (maybeStartGesture(t)) return;
