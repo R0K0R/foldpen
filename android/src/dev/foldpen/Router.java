@@ -61,7 +61,7 @@ final class Router {
     static final int DECIDE_SAMPLES = 6;
     static final long DECIDE_MS = 60, BLIP_MS = 50;
     static final float WRITE_MM = 1.2f, JUMP_MM = 8, JUMP_SPEED = 3, SIZE_JUMP = 2.0f, SIZE_JUMP_MM = 5;
-    static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450;
+    static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450, GESTURE_GIVEUP_MS = 1500;
     static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
     static final float SLOP_MM = 6, SWIPE_MM = 18, EDGE_MM = 2.5f;
     // Contact size (getTouchMajor / px-per-mm). On the Fold these are not
@@ -320,9 +320,10 @@ final class Router {
         c.area = c.major * Math.max(c.minor, 0); c.n = 1;
         contacts.put(c.id, c);
         if (gesture) {
-            // a palm landing mid-gesture is not another finger of it
-            if (palmLike(c)) { c.state = S.REJECTED; dbg(c, "rej:palm-size"); }
-            else joinGesture(c);
+            // only the three fingers that started it belong to a gesture;
+            // anything landing during one is ignored until it ends
+            c.state = S.REJECTED;
+            dbg(c, "rej:during-gesture");
             return;
         }
         dbg(c, "down");
@@ -408,7 +409,9 @@ final class Router {
                     }
                     break;
                 case GESTURE:
-                    if (palmLike(c)) {
+                    // Sliding fingertips grow to ~7.4 px, past the pen-mode
+                    // palm limit; only a clearly palm-sized one cancels.
+                    if (c.major >= 2 * palmThreshold()) {
                         // a "finger" of the gesture grew into a palm: it was
                         // the hand resting, not a gesture -- swallow it
                         gestureFired = true;
@@ -664,13 +667,18 @@ final class Router {
 
     // ================================================================ gestures
 
+    /** A gesture is exactly three fingers on an otherwise empty screen, all
+     *  landed within GESTURE_SPREAD_MS. Anything else down -- a resting palm,
+     *  whose edges also report as tiny contacts, or the pen -- means it is
+     *  not one: palm + pen + a palm edge used to start a "gesture" that then
+     *  swallowed every later contact, the pen included. */
     private boolean maybeStartGesture(long now) {
-        int n = 0;
+        if (contacts.size() != 3 || !palms.isEmpty() && recentPalm()) return false;
         for (int i = 0; i < contacts.size(); i++) {
             Contact c = contacts.valueAt(i);
-            if (c.state != S.REJECTED && !palmLike(c) && now - c.downT <= GESTURE_SPREAD_MS) n++;
+            if (c.state == S.REJECTED || c.state == S.ACTIVE || c.palm
+                    || now - c.downT > GESTURE_SPREAD_MS) return false;
         }
-        if (n < 3) return false;
         gesture = true;
         gestureFired = false;
         gestureMax = 0;
@@ -684,7 +692,28 @@ final class Router {
         }
         handler.removeCallbacks(tick);
         handler.postDelayed(gestureHold, GESTURE_HOLD_MS);
+        handler.postDelayed(gestureGiveUp, GESTURE_GIVEUP_MS);
         return true;
+    }
+
+    private boolean recentPalm() {
+        long now = SystemClock.uptimeMillis();
+        for (float[] p : palms) if (p[3] == 0 || now - p[3] < PALM_MEMORY_MS) return true;
+        return false;
+    }
+
+    /** A gesture that has not fired by now was a hand, not a command: its
+     *  contacts are let go (rejected), and the next contact starts fresh. */
+    private final Runnable gestureGiveUp = this::gestureGiveUp;
+
+    private void gestureGiveUp() {
+        if (!gesture) return;
+        for (int i = 0; i < contacts.size(); i++) {
+            Contact c = contacts.valueAt(i);
+            if (c.state == S.GESTURE) { c.state = S.REJECTED; dbg(c, "gesture:timeout"); }
+        }
+        handler.removeCallbacks(gestureHold);
+        gesture = false;
     }
 
     private void joinGesture(Contact c) {
@@ -712,6 +741,7 @@ final class Router {
     private void gestureUp() {
         for (int i = 0; i < contacts.size(); i++) if (contacts.valueAt(i).state == S.GESTURE) return;
         handler.removeCallbacks(gestureHold);
+        handler.removeCallbacks(gestureGiveUp);
         if (!gestureFired && gestureMax < SLOP_MM * mm
                 && SystemClock.uptimeMillis() - gestureT0 < GESTURE_TAP_MS) fire("display");
         gesture = false;
