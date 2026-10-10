@@ -77,6 +77,13 @@ final class Router {
     // judged against it instead: palm if within BLOB_NEAR_MM of it or at least
     // BLOB_FRACTION of its size, otherwise the pen.
     static final float BIG_PX = 20, BLOB_NEAR_MM = 25, BLOB_FRACTION = 0.4f;
+    // A dummy pen at the edge of detection flickers: contact for ~25 ms, lost,
+    // back a few mm on (measured). A lifted pen is held "down" STITCH_MS; a
+    // contact landing within STITCH_MM of where it left continues the same
+    // stroke. A too-short fragment is kept as a ghost for as long, and a
+    // fragment landing next to it inherits its samples and start time.
+    static final long STITCH_MS = 100;
+    static final float STITCH_MM = 10;
 
     static final int PEN_IN_RANGE = 1, PEN_TOUCH = 2, PEN_BTN1 = 4, PEN_ERASER = 8, PEN_BTN2 = 16;
     static final int TOUCH_DOWN = 1, TOUCH_PALM = 2;
@@ -85,7 +92,7 @@ final class Router {
 
     static final class Contact {
         final int id;
-        final long downT;
+        long downT;                                // may move back: inherited by a stitch
         final float x0, y0;
         float x, y, major, gx0, gy0, lastMajor;
         float minor, size, pressure, path, area;   // maxima / total over the stroke
@@ -118,6 +125,10 @@ final class Router {
     // fingers
     private final SparseArray<Contact> contacts = new SparseArray<>();
     private Contact penFinger;
+    private Contact lifted;            // pen contact whose lift is pending (STITCH_MS)
+    private Contact ghost;             // too-short fragment, kept STITCH_MS
+    private long liftedT, ghostT;
+    private final Runnable penLift = this::liftNow;
     private final ArrayList<float[]> palms = new ArrayList<>();   // x, y, radius, endTime(0 = down)
     private float majorEma;
     private final boolean[] slots = new boolean[10];
@@ -161,6 +172,7 @@ final class Router {
         boolean changed = !finger.equals(this.finger) || edit != this.edit;
         this.finger = finger;
         this.edit = edit;
+        if (changed) liftNow();
         if (!changed) return;
         for (int i = 0; i < contacts.size(); i++) {
             Contact c = contacts.valueAt(i);
@@ -231,6 +243,7 @@ final class Router {
         handler.removeCallbacks(proxOut);
         penLastSeen = SystemClock.uptimeMillis();
         if (penFinger != null) { endPenFinger(true); }
+        liftNow();
         if (touching) rejectFingersForStylus();
         penInRange = true;
         penTouching = touching;
@@ -354,6 +367,7 @@ final class Router {
             else if (c.major >= 2 * palmThreshold()) { markPalm(c); dbg(c, "rej:palm-size"); }
         }
         c.buf.add(new float[]{x, y, 0});
+        if (c.state == S.PENDING && finger.equals("pen") && !edit && stitch(c, t)) return;
         if (maybeStartGesture(t)) return;
         if (c.state == S.PENDING && finger.equals("pen") && penFinger == null) maybeTwoTap(c, t);
         if (c.state == S.PENDING) {
@@ -464,14 +478,22 @@ final class Router {
             // nothing is writing -- a tap during a stroke is the hand bouncing.
             if (!finger.equals("pen")) activate(c);
             else {
-                if (SystemClock.uptimeMillis() - c.downT < BLIP_MS) dbg(c, "rej:blip");
-                else decide(c);
+                if (SystemClock.uptimeMillis() - c.downT < BLIP_MS) {
+                    ghost = c; ghostT = SystemClock.uptimeMillis();
+                    dbg(c, "ghost");
+                } else decide(c);
             }
             flushTouch();
         }
         contacts.remove(id);
         if (c.state == S.ACTIVE) {
-            if (c == penFinger) endPenFinger(false);
+            if (c == penFinger) {
+                // not lifted yet: the pen may only have flickered (STITCH_MS)
+                penFinger = null;
+                lifted = c; liftedT = SystemClock.uptimeMillis();
+                handler.removeCallbacks(penLift);
+                handler.postDelayed(penLift, STITCH_MS);
+            }
             else {
                 if (canceled) { c.cancel = true; cancelled.add(c); }
                 else freeSlot(c);
@@ -543,12 +565,14 @@ final class Router {
             return;
         }
         // finger = pen (claimPen has settled who): not a palm
-        if (penFinger != null || stylusRecently() || palmLike(c) || nearPalm(c)) {
-            if (palmLike(c)) markPalm(c); else c.state = S.REJECTED;
-            dbg(c, stylusRecently() ? "rej:stylus" : palmLike(c) ? "rej:palm-size" : "rej:near-palm");
+        // size and palms were judged in decide(); only the pen's own state here
+        if (penFinger != null || stylusRecently()) {
+            c.state = S.REJECTED;
+            dbg(c, stylusRecently() ? "rej:stylus" : "rej:pen-busy");
             c.buf.clear();
             return;
         }
+        liftNow();                         // a different stroke: end the old one first
         // whatever else is down and older is the hand holding the pen
         for (int i = 0; i < contacts.size(); i++) {
             Contact o = contacts.valueAt(i);
@@ -567,7 +591,52 @@ final class Router {
         c.buf.clear();
     }
 
+    /** A contact landing where the pen just left (or next to a ghost fragment)
+     *  is the same pen. Returns true if it was taken as a continuation. */
+    private boolean stitch(Contact c, long t) {
+        long now = SystemClock.uptimeMillis();
+        Contact l = lifted;
+        if (l != null && now - liftedT < STITCH_MS && penFinger == null
+                && Math.hypot(c.x0 - l.x, c.y0 - l.y) < STITCH_MM * mm) {
+            handler.removeCallbacks(penLift);
+            lifted = null;
+            c.state = S.ACTIVE;
+            penFinger = c;
+            c.buf.clear();
+            sendPen(PEN_IN_RANGE | PEN_TOUCH, c.x0 / w, c.y0 / h, FINGER_PEN_PRESSURE, 0, 0, t);
+            host.ink(c.x0, c.y0, true);
+            dbg(c, "stitch:pen");
+            return true;
+        }
+        Contact g = ghost;
+        if (g != null && now - ghostT < STITCH_MS && Math.hypot(c.x0 - g.x, c.y0 - g.y) < STITCH_MM * mm) {
+            ghost = null;
+            ArrayList<float[]> b = new ArrayList<>();
+            for (float[] s : g.buf) b.add(s);
+            for (float[] s : c.buf) b.add(new float[]{s[0], s[1], s[2] + (c.downT - g.downT)});
+            c.buf.clear();
+            c.buf.addAll(b);
+            c.downT = g.downT;
+            c.n += g.n;
+            c.mEarly = Math.max(c.mEarly, g.mEarly);
+            dbg(c, "stitch:ghost");
+        }
+        return false;
+    }
+
+    /** Send the pending pen lift now (a new stroke, a mode change, ...). */
+    private void liftNow() {
+        handler.removeCallbacks(penLift);
+        Contact l = lifted;
+        if (l == null) return;
+        lifted = null;
+        host.ink(l.x, l.y, false);
+        sendPen(0, l.x / w, l.y / h, 0, 0, 0);
+        dbg(l, "lift");
+    }
+
     private void endPenFinger(boolean takenOver) {
+        liftNow();
         Contact c = penFinger;
         if (c == null) return;
         penFinger = null;
