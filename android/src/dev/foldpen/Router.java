@@ -118,7 +118,11 @@ final class Router {
 
     // gesture
     // finger = pen: two fingers tapped together = the pen's side button
+    // Fingertips land at 3.4-5.9 px, the dummy pen at 0.5-2.5 (measured): a
+    // pen landing with a palm edge used to make a "two-finger tap" -- the
+    // side button, Rnote's eraser -- out of a pen touch.
     static final long TWO_SPREAD_MS = 150, TWO_TAP_MS = 350;
+    static final float TWO_MIN_PX = 3.0f;
     private Contact twoA, twoB;
 
     private boolean gesture, gestureFired;
@@ -633,13 +637,14 @@ final class Router {
     // ================================================================ 2-finger tap
 
     private void maybeTwoTap(Contact c, long t) {
+        if (c.major < TWO_MIN_PX || recentPalm()) return;
         Contact other = null;
         int n = 0;
         for (int i = 0; i < contacts.size(); i++) {
             Contact o = contacts.valueAt(i);
             if (o.state == S.REJECTED) continue;
             n++;
-            if (o != c && o.state == S.PENDING && t - o.downT <= TWO_SPREAD_MS) other = o;
+            if (o != c && o.state == S.PENDING && t - o.downT <= TWO_SPREAD_MS && o.major >= TWO_MIN_PX) other = o;
         }
         if (n != 2 || other == null) return;
         twoA = other; twoB = c;
