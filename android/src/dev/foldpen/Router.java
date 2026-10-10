@@ -45,17 +45,21 @@ final class Router {
 
     // timing (ms) and distances (mm)
     static final long TOUCH_HOLD_MS = 55, GESTURE_SPREAD_MS = 220;
-    // finger = pen: a contact is the pen once it WRITES (moves WRITE_MM); one
-    // that sits still for REST_MS first is a resting hand. A tap is a contact
-    // lifted before REST_MS without writing.
-    // Strokes are buffered until they qualify and dropped if they don't:
-    // shorter than BLIP_MS, idle for REST_MS before writing, or corrupted --
-    // a sample jumping more than JUMP_MM at over JUMP_SPEED (mm/ms = m/s;
-    // faster than a hand writes, what a palm contact snapping does), or a
-    // contact size changing by SIZE_JUMP x AND SIZE_JUMP_MM (sizes are
-    // quantised: 0.1 -> 0.2 mm is not a palm). Corruption after a stroke went
-    // live ends it there.
-    static final long REST_MS = 400, BLIP_MS = 50;
+    // finger = pen, after Chromium's touch palm filter (ui/events/ozone/evdev/
+    // touch_filter, NeuralStylusPalmDetectionFilter: IsHeuristicPalmStroke and
+    // its hold-then-decide flow). Every new contact is held (buffered) for
+    // DECIDE_SAMPLES samples or DECIDE_MS, then decided ONCE from the maxima
+    // over that window: palm if its major axis or its area (major x minor)
+    // reaches the limits below. A stroke lifted before that is decided at
+    // lift, or dropped if shorter than BLIP_MS. Not-palm strokes take the pen
+    // last-writer-wins. Chromium's other rule -- any touch within 100 mm of a
+    // big blob is palm -- is left out: here the pen IS a touch next to the palm.
+    // Also dropped: corrupted strokes -- a sample jumping more than JUMP_MM at
+    // over JUMP_SPEED (mm/ms = m/s, what a palm contact snapping does), or a
+    // size change of SIZE_JUMP x AND SIZE_JUMP_MM. Corruption after a stroke
+    // went live ends it there.
+    static final int DECIDE_SAMPLES = 6;
+    static final long DECIDE_MS = 60, BLIP_MS = 50;
     static final float WRITE_MM = 1.2f, JUMP_MM = 8, JUMP_SPEED = 3, SIZE_JUMP = 2.0f, SIZE_JUMP_MM = 5;
     static final long GESTURE_TAP_MS = 400, GESTURE_HOLD_MS = 450;
     static final long STYLUS_GRACE_MS = 400, PALM_MEMORY_MS = 350;
@@ -64,7 +68,8 @@ final class Router {
     // real mm, but they separate (measured, 14.7 px/mm): dummy pen 0.5-2.5 px,
     // fingertip 3.9-5.9 px, palm edge landing at 8+ px and growing to 12-60.
     // 0.45 "mm" = 6.6 px sits between fingertips and palm edges.
-    static final float PALM_MM = 0.45f, PALM_EMA_X = 3, PALM_MAX_MM = 22, PALM_NEAR_MM = 15;
+    // Area limit likewise: pen <= 5 px^2, fingertip 8-20, palm edge 35+.
+    static final float PALM_MM = 0.45f, PALM_AREA_MM2 = 0.116f, PALM_EMA_X = 3, PALM_MAX_MM = 22, PALM_NEAR_MM = 15;
     static final float FINGER_PEN_PRESSURE = 0.5f;
 
     static final int PEN_IN_RANGE = 1, PEN_TOUCH = 2, PEN_BTN1 = 4, PEN_ERASER = 8, PEN_BTN2 = 16;
@@ -77,7 +82,8 @@ final class Router {
         final long downT;
         final float x0, y0;
         float x, y, major, gx0, gy0, lastMajor;
-        float minor, size, pressure, path;        // maxima / total, for tuning
+        float minor, size, pressure, path, area;   // maxima / total over the stroke
+        int n;                                     // samples seen
         long lastT;
         S state = S.PENDING;
         boolean palm, cancel;
@@ -295,17 +301,23 @@ final class Router {
 
     /** `adb logcat -s foldpen-palm` -- every contact decision, for tuning. */
     private void dbg(Contact c, String what) {
-        Log.d("foldpen-palm", String.format(java.util.Locale.ROOT,
+        String line = String.format(java.util.Locale.ROOT,
                 "#%d %-14s t=%4dms at=(%.0f,%.0f)mm moved=%.1fmm path=%.1fmm major=%.2fpx minor=%.2fpx size=%.4f pres=%.3f pen=%s",
                 c.id, what, SystemClock.uptimeMillis() - c.downT, c.x / mm, c.y / mm,
                 Math.hypot(c.x - c.x0, c.y - c.y0) / mm, c.path / mm, c.major, c.minor, c.size, c.pressure,
-                penFinger == null ? "-" : "#" + penFinger.id));
+                penFinger == null ? "-" : "#" + penFinger.id);
+        Log.d("foldpen-palm", line);
+        // also to the daemon's journal (journalctl --user -u foldpen), so
+        // tuning does not need adb
+        try { link.sendJson(Link.T_CMD, new JSONObject().put("cmd", "log").put("l", line)); }
+        catch (Exception ignored) { }
     }
 
     private void fingerDown(MotionEvent e, int i, long t) {
         float x = e.getX(i), y = e.getY(i);
         Contact c = new Contact(e.getPointerId(i), t, x, y, e.getTouchMajor(i));
         c.minor = e.getTouchMinor(i); c.size = e.getSize(i); c.pressure = e.getPressure(i);
+        c.area = c.major * Math.max(c.minor, 0); c.n = 1;
         contacts.put(c.id, c);
         if (gesture) {
             // a palm landing mid-gesture is not another finger of it
@@ -347,6 +359,8 @@ final class Router {
             c.minor = Math.max(c.minor, cur ? e.getTouchMinor(i) : e.getHistoricalTouchMinor(i, k));
             c.size = Math.max(c.size, cur ? e.getSize(i) : e.getHistoricalSize(i, k));
             c.pressure = Math.max(c.pressure, cur ? e.getPressure(i) : e.getHistoricalPressure(i, k));
+            c.area = Math.max(c.area, maj * (cur ? e.getTouchMinor(i) : e.getHistoricalTouchMinor(i, k)));
+            c.n++;
             c.x = x; c.y = y;
             c.major = Math.max(c.major, maj);
             if (corrupt && (c.state == S.PENDING || c == penFinger)) {
@@ -358,9 +372,8 @@ final class Router {
             }
             switch (c.state) {
                 case PENDING:
-                    if (finger.equals("pen") && palmLike(c)) { markPalm(c); dbg(c, "rej:palm-grew"); break; }
                     c.buf.add(new float[]{x, y, st - c.downT});
-                    if (finger.equals("pen") && Math.hypot(x - c.x0, y - c.y0) > WRITE_MM * mm) claimPen(c);
+                    if (finger.equals("pen") && c.n >= DECIDE_SAMPLES) decide(c);
                     break;
                 case ACTIVE:
                     if (c == penFinger) {
@@ -391,7 +404,7 @@ final class Router {
                         for (Contact o : new Contact[]{twoA, twoB})
                             if (o != null && o.state == S.TWO) o.state = S.PENDING;
                         twoA = twoB = null;
-                        claimPen(c);
+                        decide(c);
                     }
                     break;
                 case GESTURE:
@@ -419,9 +432,8 @@ final class Router {
             // nothing is writing -- a tap during a stroke is the hand bouncing.
             if (!finger.equals("pen")) activate(c);
             else {
-                long held = SystemClock.uptimeMillis() - c.downT;
-                if (held < BLIP_MS) dbg(c, "rej:blip");
-                else if (held < REST_MS) claimPen(c);
+                if (SystemClock.uptimeMillis() - c.downT < BLIP_MS) dbg(c, "rej:blip");
+                else decide(c);
             }
             flushTouch();
         }
@@ -439,10 +451,10 @@ final class Router {
         if (c == twoA || c == twoB) twoUp(c);
     }
 
-    private long holdMs() { return finger.equals("pen") ? REST_MS : TOUCH_HOLD_MS; }
+    private long holdMs() { return finger.equals("pen") ? DECIDE_MS : TOUCH_HOLD_MS; }
 
-    /** Touch mode: pending contacts that outlast the hold window become
-     *  touches. Pen mode: ones that sat still that long are a resting hand. */
+    /** Pending contacts that outlast the hold window: touches in touch mode;
+     *  decided in pen mode (a still contact delivers no samples to count). */
     private void activateReady() {
         long now = SystemClock.uptimeMillis();
         long next = Long.MAX_VALUE;
@@ -451,11 +463,19 @@ final class Router {
             if (c.state != S.PENDING) continue;
             long due = c.downT + holdMs();
             if (due > now) { next = Math.min(next, due); continue; }
-            if (finger.equals("pen")) { c.state = S.REJECTED; c.buf.clear(); dbg(c, "rej:resting"); }
+            if (finger.equals("pen")) decide(c);
             else activate(c);
         }
         if (next != Long.MAX_VALUE) handler.postDelayed(tick, Math.max(1, next - now));
         flushTouch();
+    }
+
+    /** The one decision per stroke (pen mode), from its window's maxima. */
+    private void decide(Contact c) {
+        if (c.state != S.PENDING) return;
+        if (palmLike(c)) { markPalm(c); dbg(c, "rej:palm"); return; }
+        if (nearPalm(c)) { c.state = S.REJECTED; c.buf.clear(); dbg(c, "rej:near-palm"); return; }
+        claimPen(c);
     }
 
     /** Pen mode arbitration, for a stroke that has qualified: last-writer-
@@ -534,7 +554,8 @@ final class Router {
     }
 
     private boolean palmLike(Contact c) {
-        return c.major > 0 && c.major > palmThreshold();
+        return (c.major > 0 && c.major >= palmThreshold())
+                || (c.area > 0 && c.area >= PALM_AREA_MM2 * mm * mm * Math.max(1, palmThreshold() / (PALM_MM * mm)));
     }
 
     private boolean atEdge(Contact c) {

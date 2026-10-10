@@ -553,6 +553,8 @@ class Daemon:
             cmd = m.get("cmd")
             if cmd == "toggle":
                 self.toggle(m.get("what"))
+            elif cmd == "log":
+                log("phone:", str(m.get("l", ""))[:300])
             elif cmd == "rect" and self.st.rect and self.mon:
                 self.rect_op(m.get("dx", 0.0), m.get("dy", 0.0), m.get("scale", 1.0),
                              m.get("cx", 0.5), m.get("cy", 0.5))
