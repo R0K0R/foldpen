@@ -195,6 +195,10 @@ public final class MainActivity extends Activity implements Link.Listener, Route
             haveState = true;
             display = d; edit = e; finger = f;
             router.setModes(f, e);
+            JSONObject cal = s.optJSONObject("calib");
+            if (cal != null) router.setCalibration(cal.optDouble("palm_px", -1),
+                    cal.optDouble("palm_area", -1), cal.optDouble("grow_px", -1));
+            else router.setCalibration(-1, -1, -1);
             if (!d) view.setFrame(null);
             applyBrightness();
         });

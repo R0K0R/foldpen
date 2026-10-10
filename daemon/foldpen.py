@@ -275,13 +275,15 @@ class State:
         self.rect = d.get("rect")              # [x, y, w, h]
         self.finger = d.get("finger", "pen")   # "pen" | "touch"
         self.token = d.get("token") or secrets.token_hex(16)
+        self.calib = d.get("calib")            # palm thresholds from `calibrate fit`
         self.display = False
         self.edit = False
         self.save()
 
     def save(self):
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"rect": self.rect, "finger": self.finger, "token": self.token}))
+        tmp.write_text(json.dumps({"rect": self.rect, "finger": self.finger, "token": self.token,
+                                   "calib": self.calib}))
         os.chmod(tmp, 0o600)
         tmp.replace(self.path)
 
@@ -299,6 +301,7 @@ class Daemon:
         self.client = None          # (reader, writer)
         self.overlay = None
         self.pair_code = None       # (code, expiry)
+        self.calib_label = None     # ("pen" | "palm", until)
         self.last_input = 0.0
         self.frame_wake = asyncio.Event()
         self.pen_q = None           # samples held behind a fresh proximity-in
@@ -375,7 +378,8 @@ class Daemon:
 
     # state broadcast ------------------------------------------------------------
     def state_msg(self, **extra):
-        return {"display": self.st.display, "finger": self.st.finger, "edit": self.st.edit, **extra}
+        return {"display": self.st.display, "finger": self.st.finger, "edit": self.st.edit,
+                "calib": self.st.calib, **extra}
 
     def changed(self, save=False):
         if save:
@@ -553,6 +557,12 @@ class Daemon:
             cmd = m.get("cmd")
             if cmd == "toggle":
                 self.toggle(m.get("what"))
+            elif cmd == "contact":
+                lab = self.calib_label
+                if lab and time.monotonic() < lab[1]:
+                    m["label"] = lab[0]
+                    with open(STATE_DIR / "calib.jsonl", "a") as f:
+                        f.write(json.dumps(m) + "\n")
             elif cmd == "log":
                 log("phone:", str(m.get("l", ""))[:300])
             elif cmd == "rect" and self.st.rect and self.mon:
@@ -729,6 +739,22 @@ class Daemon:
             code = f"{secrets.randbelow(10**6):06d}"
             self.pair_code = (code, time.monotonic() + 120)
             return {"code": code}
+        elif w[:1] == ["calibrate"] and len(w) == 2:
+            if w[1] in ("pen", "palm"):
+                self.calib_label = (w[1], time.monotonic() + CALIB_SECONDS)
+                return {"recording": w[1], "seconds": CALIB_SECONDS}
+            if w[1] == "reset":
+                self.st.calib = None
+                (STATE_DIR / "calib.jsonl").unlink(missing_ok=True)
+                self.changed(save=True)
+                return {"calib": None}
+            if w[1] == "fit":
+                res = fit_calibration(STATE_DIR / "calib.jsonl")
+                if "calib" in res:
+                    self.st.calib = res["calib"]
+                    self.changed(save=True)
+                return res
+            return {"error": "calibrate pen|palm|fit|reset"}
         elif w[:1] == ["token"]:
             return {"token": self.st.token, "port": self.args.port}
         elif w[:1] == ["monitors"]:
@@ -766,6 +792,47 @@ class Daemon:
         await stop.wait()
         self.stop_overlay()
         self.dev.release_all()
+
+
+CALIB_SECONDS = 20
+
+
+def fit_calibration(path):
+    """Palm limits that separate the recorded pen and palm contacts.
+
+    The phone decides once, from the largest size within its ~60 ms hold
+    ("me"/"ae"), so the limit sits between the pen's high end and the palm's
+    low end there. Where they overlap, the limit favours keeping pen strokes
+    (a palm stroke can be undone; a missing pen stroke is the bigger
+    annoyance). A live stroke ends only past the pen's own largest size."""
+    try:
+        recs = [json.loads(l) for l in open(path)]
+    except OSError:
+        return {"error": "nothing recorded: run `foldpen calibrate pen` / `palm` first"}
+    pen = [r for r in recs if r.get("label") == "pen" and r.get("dur", 0) >= 50]
+    palm = [r for r in recs if r.get("label") == "palm"]
+    if len(pen) < 5 or len(palm) < 3:
+        return {"error": f"need >= 5 pen and >= 3 palm contacts, have {len(pen)} and {len(palm)}"}
+
+    def q(vals, f):
+        vals = sorted(vals)
+        return vals[min(len(vals) - 1, max(0, int(f * (len(vals) - 1) + 0.5)))]
+
+    def limit(key):
+        hi_pen, lo_palm = q([r[key] for r in pen], 0.97), q([r[key] for r in palm], 0.25)
+        return (hi_pen + lo_palm) / 2 if lo_palm > hi_pen else hi_pen * 1.05, hi_pen, lo_palm
+
+    palm_px, pen_hi, palm_lo = limit("me")
+    palm_area, pen_ahi, palm_alo = limit("ae")
+    grow = max(q([r["mx"] for r in pen], 0.99) * 1.15, palm_px)
+    report = {
+        "pen_contacts": len(pen), "palm_contacts": len(palm),
+        "pen_early_major_p97": round(pen_hi, 2), "palm_early_major_p25": round(palm_lo, 2),
+        "pen_early_area_p97": round(pen_ahi, 2), "palm_early_area_p25": round(palm_alo, 2),
+        "overlap": palm_lo <= pen_hi or palm_alo <= pen_ahi,
+        "calib": {"palm_px": round(palm_px, 2), "palm_area": round(palm_area, 2), "grow_px": round(grow, 2)},
+    }
+    return report
 
 
 def broadcast_addrs():
@@ -865,6 +932,8 @@ def main():
     s.add_argument("what", choices=["display", "finger", "edit"])
     s.add_argument("value")
     sub.add_parser("status")
+    c = sub.add_parser("calibrate", help="palm rejection: record `pen` / `palm` (20 s each), then `fit`; `reset` to undo")
+    c.add_argument("what", choices=["pen", "palm", "fit", "reset"])
     sub.add_parser("pair", help="show a 6-digit code to type on the phone (valid 2 min)")
     u = sub.add_parser("usb", help="adb reverse the port and give the phone its token")
     u.add_argument("--port", type=int, default=PORT)
@@ -876,6 +945,19 @@ def main():
         asyncio.run(Daemon(a).run())
     elif a.cmd in ("toggle", "status"):
         print(json.dumps(ctl(a.cmd, *([a.what] if a.cmd == "toggle" else []))))
+    elif a.cmd == "calibrate":
+        r = ctl("calibrate", a.what)
+        if a.what in ("pen", "palm") and "recording" in r:
+            hint = ("write normally with ONLY the pen, hand lifted, pressing as you really do"
+                    if a.what == "pen" else
+                    "rest and move ONLY your palm / hand edge, the way it lands while writing; no pen")
+            print(f"recording {a.what} for {r['seconds']} s: {hint}")
+            for left in range(r["seconds"], 0, -1):
+                print(f"\r{left:2d} s ", end="", flush=True)
+                time.sleep(1)
+            print("\rdone.  next: foldpen calibrate " + ("palm" if a.what == "pen" else "fit"))
+        else:
+            print(json.dumps(r, indent=2))
     elif a.cmd == "set":
         print(json.dumps(ctl("set", a.what, a.value)))
     elif a.cmd == "pair":

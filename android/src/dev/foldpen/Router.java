@@ -84,6 +84,8 @@ final class Router {
         float x, y, major, gx0, gy0, lastMajor;
         float minor, size, pressure, path, area;   // maxima / total over the stroke
         int n;                                     // samples seen
+        float mEarly, aEarly;                      // maxima within DECIDE_MS: what decide() sees
+        float major0;                              // at landing
         long lastT;
         S state = S.PENDING;
         boolean palm, cancel;
@@ -322,6 +324,7 @@ final class Router {
         Contact c = new Contact(e.getPointerId(i), t, x, y, e.getTouchMajor(i));
         c.minor = e.getTouchMinor(i); c.size = e.getSize(i); c.pressure = e.getPressure(i);
         c.area = c.major * Math.max(c.minor, 0); c.n = 1;
+        c.mEarly = c.major0 = c.major; c.aEarly = c.area;
         contacts.put(c.id, c);
         if (gesture) {
             // only the three fingers that started it belong to a gesture;
@@ -366,6 +369,7 @@ final class Router {
             c.pressure = Math.max(c.pressure, cur ? e.getPressure(i) : e.getHistoricalPressure(i, k));
             c.area = Math.max(c.area, maj * (cur ? e.getTouchMinor(i) : e.getHistoricalTouchMinor(i, k)));
             c.n++;
+            if (st - c.downT <= DECIDE_MS) { c.mEarly = Math.max(c.mEarly, maj); c.aEarly = c.area; }
             c.x = x; c.y = y;
             c.major = Math.max(c.major, maj);
             if (corrupt && (c.state == S.PENDING || c == penFinger)) {
@@ -382,7 +386,7 @@ final class Router {
                     break;
                 case ACTIVE:
                     if (c == penFinger) {
-                        if (palmLike(c)) {      // a palm rolled onto the "pen"
+                        if (grewIntoPalm(c)) {  // a palm rolled onto the "pen"
                             endPenFinger(false);
                             markPalm(c);
                             dbg(c, "end:palm-grew");
@@ -433,6 +437,14 @@ final class Router {
         Contact c = contacts.get(id);
         if (c == null) return;
         dbg(c, "up:" + c.state + (canceled ? ":canceled" : ""));
+        // size summary for `foldpen calibrate` (the daemon keeps it only while
+        // a calibration label is set)
+        try {
+            link.sendJson(Link.T_CMD, new JSONObject().put("cmd", "contact")
+                    .put("m0", c.major0).put("me", c.mEarly).put("mx", c.major)
+                    .put("ae", c.aEarly).put("ax", c.area)
+                    .put("dur", SystemClock.uptimeMillis() - c.downT).put("path", c.path / mm));
+        } catch (Exception ignored) { }
         if (c.state == S.PENDING && !canceled) {
             // A quick tap, shorter than the hold window: decide now, and let
             // the daemon see it down before it goes up. In pen mode only while
@@ -556,13 +568,28 @@ final class Router {
     /** Bigger than any pen tip: an absolute floor, raised by what this pen's
      *  contacts have actually measured (a fingertip-sized dummy pen and a
      *  fine-tipped one end up with different thresholds). */
+    // From `foldpen calibrate fit` (px, px^2), via the daemon's state; <= 0 = unset.
+    private float calPalmPx = -1, calPalmArea = -1, calGrowPx = -1;
+
+    void setCalibration(double palmPx, double palmArea, double growPx) {
+        calPalmPx = (float) palmPx; calPalmArea = (float) palmArea; calGrowPx = (float) growPx;
+    }
+
     private float palmThreshold() {
+        if (calPalmPx > 0) return calPalmPx;
         return Math.min(Math.max(PALM_MM * mm, majorEma * PALM_EMA_X), PALM_MAX_MM * mm);
     }
 
+    /** Mid-stroke: a pressed rubber tip flattens and grows, so a live stroke
+     *  ends only past the pen's own calibrated maximum (or the palm limit). */
+    private boolean grewIntoPalm(Contact c) {
+        return calGrowPx > 0 ? c.major >= calGrowPx : palmLike(c);
+    }
+
     private boolean palmLike(Contact c) {
-        return (c.major > 0 && c.major >= palmThreshold())
-                || (c.area > 0 && c.area >= PALM_AREA_MM2 * mm * mm * Math.max(1, palmThreshold() / (PALM_MM * mm)));
+        float areaLimit = calPalmArea > 0 ? calPalmArea
+                : PALM_AREA_MM2 * mm * mm * Math.max(1, palmThreshold() / (PALM_MM * mm));
+        return (c.major > 0 && c.major >= palmThreshold()) || (c.area > 0 && c.area >= areaLimit);
     }
 
     private boolean atEdge(Contact c) {
