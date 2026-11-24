@@ -1,4 +1,8 @@
-{ stdenvNoCC, androidenv, jdk17_headless, zip }:
+{ lib, stdenvNoCC, androidenv, jdk17_headless, zip
+  # false: a finger never becomes the pen (fingers are always touch; only the
+  # S Pen draws). Written into android/src/dev/foldpen/Flags.java.
+, fingerPen ? true
+}:
 
 # Built without Gradle: the app uses framework APIs only (no AndroidX, no
 # resources besides the manifest), so aapt2 + javac + d8 + zipalign is all of
@@ -20,12 +24,14 @@ let
   jar = "${root}/platforms/android-${platform}/android.jar";
 in
 stdenvNoCC.mkDerivation {
-  pname = "foldpen-apk";
+  pname = "foldpen-apk" + lib.optionalString (!fingerPen) "-no-finger-pen";
   version = "1";
   src = ../android;
   nativeBuildInputs = [ jdk17_headless zip ];
   buildPhase = ''
     runHook preBuild
+    substituteInPlace src/dev/foldpen/Flags.java \
+      --replace-fail "FINGER_PEN = true;" "FINGER_PEN = ${lib.boolToString fingerPen};"
     ${bt}/aapt2 link -o base.apk -I ${jar} --manifest AndroidManifest.xml \
       --min-sdk-version 30 --target-sdk-version ${platform} \
       --version-code 1 --version-name 1

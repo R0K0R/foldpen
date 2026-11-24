@@ -124,7 +124,7 @@ final class Router {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private float w = 1, h = 1, mm = 10;
 
-    String finger = "pen";
+    String finger = Flags.FINGER_PEN ? "pen" : "touch";
     boolean edit;
 
     // stylus
@@ -179,6 +179,7 @@ final class Router {
 
     /** State from the daemon. Mode changes drop whatever is in flight. */
     void setModes(String finger, boolean edit) {
+        if (!Flags.FINGER_PEN) finger = "touch";   // built without finger = pen
         boolean changed = !finger.equals(this.finger) || edit != this.edit;
         this.finger = finger;
         this.edit = edit;

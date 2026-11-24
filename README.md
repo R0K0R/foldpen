@@ -50,6 +50,8 @@ foldpen install    # sign (key in ~/.local/state/foldpen), adb install, hand ove
 foldpen usb        # later: re-tunnel the port over USB (adb reverse) and launch
 ```
 
+**S Pen only.** The `apk-no-finger-pen` package (`apk.override { fingerPen = false; }`) is a build in which a finger never becomes the pen. Fingers are always touchscreen contacts, the finger-mode swipe is refused with an error buzz, and the phone flips the PC's state back to `touch` (so `SUPER+ALT+F` does nothing). To install it: `FOLDPEN_APK=$(nix build --print-out-paths .#apk-no-finger-pen) foldpen install`.
+
 Over Wi-Fi the phone finds the PC through a UDP beacon (port 7393). If it has never been paired, run `foldpen pair` and type the 6-digit code on the phone. That is the only time the phone needs to be looked at. Every connection must present the token.
 
 ## Layout

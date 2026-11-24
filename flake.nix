@@ -19,6 +19,8 @@
     {
       packages.${system} = {
         inherit apk;
+        # only the S Pen draws: fingers are always touch, never the pen
+        apk-no-finger-pen = apk.override { fingerPen = false; };
         foldpen = pkgs.callPackage ./nix/package.nix { inherit apk; };
         default = self.packages.${system}.foldpen;
       };

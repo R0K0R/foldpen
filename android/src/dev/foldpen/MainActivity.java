@@ -38,7 +38,7 @@ public final class MainActivity extends Activity implements Link.Listener, Route
     private Vibrator vibrator;
     private volatile boolean display;
     private boolean edit;
-    private String finger = "pen";
+    private String finger = Flags.FINGER_PEN ? "pen" : "touch";
     private boolean haveState;
 
     @Override protected void onCreate(Bundle b) {
@@ -153,6 +153,11 @@ public final class MainActivity extends Activity implements Link.Listener, Route
 
     @Override public void toggle(String what) {
         if (!link.connected()) { buzz(0, 30, 60, 30, 60, 30); return; }   // nothing to toggle
+        if (what.equals("finger") && !Flags.FINGER_PEN) {                // built without finger = pen
+            buzz(0, 30, 60, 30, 60, 30);
+            view.flash("finger = pen is disabled");
+            return;
+        }
         try { link.sendJson(Link.T_CMD, new JSONObject().put("cmd", "toggle").put("what", what)); }
         catch (Exception ignored) { }
     }
@@ -185,6 +190,13 @@ public final class MainActivity extends Activity implements Link.Listener, Route
         runOnUiThread(() -> {
             boolean d = s.optBoolean("display"), e = s.optBoolean("edit");
             String f = s.optString("finger", "pen");
+            if (!Flags.FINGER_PEN && f.equals("pen")) {
+                // built without finger = pen: fingers are touch whatever the
+                // PC says; flip the PC's state too, so `foldpen status` is true
+                try { link.sendJson(Link.T_CMD, new JSONObject().put("cmd", "toggle").put("what", "finger")); }
+                catch (Exception ignored) { }
+                f = "touch";
+            }
             if (haveState) {
                 // Distinct patterns, so each toggle can be told apart blind:
                 // display = short ticks, finger mode = firm pulses, edit = long.
