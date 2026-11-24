@@ -108,21 +108,28 @@ def hyprctl(*args):
         return ""
 
 
-def monitors():
-    """Logical layout boxes of the enabled monitors: {name: (x, y, w, h)}."""
+def monitor_info():
+    """Logical layout boxes of the enabled monitors, {name: (x, y, w, h)},
+    and their transforms, {name: 0..7}. A 180 degree rotation leaves the box
+    as it was, so a change is only seen in the transforms."""
     try:
         data = json.loads(hyprctl("-j", "monitors") or "[]")
     except json.JSONDecodeError:
-        return {}
-    out = {}
+        return {}, {}
+    boxes, xforms = {}, {}
     for m in data:
         if m.get("disabled"):
             continue
         w, h = m["width"] / m["scale"], m["height"] / m["scale"]
         if m.get("transform", 0) % 2:
             w, h = h, w
-        out[m["name"]] = (float(m["x"]), float(m["y"]), w, h)
-    return out
+        boxes[m["name"]] = (float(m["x"]), float(m["y"]), w, h)
+        xforms[m["name"]] = m.get("transform", 0)
+    return boxes, xforms
+
+
+def monitors():
+    return monitor_info()[0]
 
 
 def bind_devices(output):
@@ -766,15 +773,41 @@ class Daemon:
                 "monitor": self.mon, "rect": self.st.rect}
 
     async def watch_monitors(self):
-        # Cheap poll; monitor hotplug/rotation is rare and this keeps the
-        # daemon free of a socket2 event parser.
+        # Cheap poll for hotplug and rotation. The transforms are compared
+        # too: a 180 degree turn leaves every box as it was.
+        xforms = monitor_info()[1]
         while True:
             await asyncio.sleep(3)
-            m = monitors()
-            if m and m != self.mons:
+            m, x = monitor_info()
+            if m and (m != self.mons or x != xforms):
+                xforms = x
                 self.mon = None   # force a re-bind (outputs may have moved)
                 self.refresh_monitors()
                 self.changed(save=True)
+
+    async def watch_reloads(self):
+        """Re-bind after every Hyprland config reload. The binding is a
+        runtime hl.device rule, and a reload (the rotation shim runs one on
+        every return to landscape) drops it: the devices then fell back to
+        the global input.tablet/touchdevice transform the next rotation sets,
+        and pen input came out rotated."""
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if not sig:
+            return
+        path = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "hypr" / sig / ".socket2.sock"
+        while True:
+            try:
+                reader, writer = await asyncio.open_unix_connection(str(path))
+                try:
+                    while line := await reader.readline():
+                        if line.startswith(b"configreloaded>>") and self.mon:
+                            log("hyprland config reloaded: re-binding the devices")
+                            bind_devices(self.mon)
+                finally:
+                    writer.close()
+            except OSError as e:
+                log("hyprland event socket:", e)
+            await asyncio.sleep(3)
 
     async def run(self):
         servers = [await asyncio.start_server(self.on_client, self.args.bind, self.args.port)]
@@ -783,7 +816,7 @@ class Daemon:
         servers.append(await asyncio.start_unix_server(self.on_ctl, str(CTL_SOCK)))
         os.chmod(CTL_SOCK, 0o600)
         log(f"listening on {self.args.bind}:{self.args.port}; monitor {self.mon}")
-        tasks = [asyncio.create_task(self.watch_monitors())]
+        tasks = [asyncio.create_task(self.watch_monitors()), asyncio.create_task(self.watch_reloads())]
         if not self.args.no_beacon:
             tasks.append(asyncio.create_task(self.beacon()))
         stop = asyncio.Event()
