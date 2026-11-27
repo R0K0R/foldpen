@@ -3,7 +3,9 @@
 A Galaxy Z Fold 6 (or any Android 11+ phone) as a **stylus tablet** for Hyprland.
 
 - The S Pen arrives as a real **pen tablet** (`foldpen-stylus`: pressure, tilt, side button, eraser, hover). It is not a mouse.
-- Pen input is sent the moment Android delivers it (unbuffered dispatch, every historical sample, TCP_NODELAY, its own send thread). The screen mirror can never hold it up.
+- Pen input is sent the moment Android delivers it (unbuffered dispatch, every historical sample, its own send thread). The screen mirror can never hold it up.
+- Over Wi-Fi, pen samples travel over **UDP**, each datagram repeating the last few samples, so a lost packet costs nothing. Over TCP, one loss stalled every sample behind it, which measured 40–130 ms behind. Over USB everything stays on TCP (`adb reverse` carries TCP only), with no loss to begin with.
+- The PC replays samples on the phone's own timeline behind a **playout buffer sized from measured jitter** (90th percentile of how late contact samples arrive, 2–30 ms). In practice that's about 3 ms over USB or a good Wi-Fi link. `foldpen status` shows it as `pen_buffer_ms`, and `pen_udp` says whether UDP is in use.
 - The phone addresses an **input rectangle** on the PC screen, with the phone's aspect ratio. You can move and zoom it.
 - A **mirror** of that rectangle can be shown on the phone at a low, adaptive frame rate. It runs fast while the picture changes or the pen moves, drops to about 1 fps when nothing changes, and skips frames instead of queueing them.
 - **Finger modes:** in `pen` mode every finger is the pen (for a dummy capacitive stylus) and palm rejection is on. In `touch` mode fingers are real touchscreen contacts (`foldpen-touch`), and the S Pen stays a pen.
@@ -52,6 +54,8 @@ foldpen usb        # later: re-tunnel the port over USB (adb reverse) and launch
 
 **S Pen only.** The `apk-no-finger-pen` package (`apk.override { fingerPen = false; }`) is a build in which a finger never becomes the pen. Fingers are always touchscreen contacts, the finger-mode swipe is refused with an error buzz, and the phone flips the PC's state back to `touch` (so `SUPER+ALT+F` does nothing). To install it: `FOLDPEN_APK=$(nix build --print-out-paths .#apk-no-finger-pen) foldpen install`.
 
+**USB** has the lowest and steadiest latency. Turn on USB debugging on the phone, plug it in, accept the prompt, and run `foldpen usb`. The phone tries the USB tunnel first and falls back to Wi-Fi by itself when unplugged. Run `foldpen usb` again after each replug. It only ever sets up the phone attached over USB (`ANDROID_SERIAL` overrides that), never a Waydroid container or a phone on wireless debugging.
+
 Over Wi-Fi the phone finds the PC through a UDP beacon (port 7393). If it has never been paired, run `foldpen pair` and type the 6-digit code on the phone. That is the only time the phone needs to be looked at. Every connection must present the token.
 
 ## Layout
@@ -61,4 +65,4 @@ Over Wi-Fi the phone finds the PC through a UDP beacon (port 7393). If it has ne
 - `daemon/overlay.py`: the edit-mode border (GTK3 layer-shell)
 - `nix/`: package, APK and NixOS module
 
-Wire format: `[u8 type][u32 BE length][payload]`. The phone sends `HELLO`, `PEN`, `TOUCH`, `CMD` and `VIEW`; the PC sends `STATE` (JSON) and `FRAME` (JPEG).
+Wire format: `[u8 type][u32 BE length][payload]`. The phone sends `HELLO`, `PEN`, `TOUCH`, `CMD` and `VIEW`; the PC sends `STATE` (JSON) and `FRAME` (JPEG). Pen over UDP uses the same port, keyed per connection (the key comes in the first `STATE`). The PC writes first, to the port the phone names in a `udp` command, so the phone's datagrams return as an established flow and no firewall port needs opening. The format is in the daemon's `UDP_KEEPALIVE` comment.

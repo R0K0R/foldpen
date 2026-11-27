@@ -17,14 +17,22 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.LinkedHashSet;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * TCP link to the foldpen daemon. Input goes out through a dedicated sender
  * thread (no Nagle, one write per message); frames and state come back on the
  * reader. Hosts tried, in order: a host set over adb, 127.0.0.1 (adb reverse
  * over USB), and whatever PC last sent a LAN beacon.
+ *
+ * Over the LAN, pen samples go over UDP once the daemon confirms it hears
+ * them (see the daemon's UDP_KEEPALIVE comment for the format): over TCP one
+ * lost Wi-Fi packet stalls every sample behind it until the retransmit. Each
+ * datagram repeats the last UDP_HISTORY samples, and the last one is resent
+ * UDP_REPEATS times when no new sample follows, so a loss costs nothing.
  */
 final class Link {
     interface Listener {
@@ -54,6 +62,15 @@ final class Link {
     private WifiManager.MulticastLock lock;
     private WifiManager.WifiLock lowLatency;
     volatile int viewW, viewH;
+
+    // pen over UDP
+    static final int UDP_HISTORY = 4, UDP_REPEATS = 2;
+    static final long UDP_REPEAT_MS = 12, UDP_PROBE_MS = 300, UDP_STALE_MS = 6000;
+    private final LinkedBlockingQueue<byte[]> penQueue = new LinkedBlockingQueue<>();
+    private volatile DatagramSocket udp;
+    private volatile byte[] udpKey;
+    private volatile boolean udpReady;
+    private volatile long udpAckT;
 
     Link(Context ctx, Listener listener) {
         this.ctx = ctx;
@@ -104,7 +121,12 @@ final class Link {
 
     void send(int type, byte[] payload) {
         if (out == null) return;   // never replay stale input after a reconnect
+        if (type == T_PEN && udpLive()) { penQueue.offer(payload); return; }
         queue.offer(frame(type, payload));
+    }
+
+    private boolean udpLive() {
+        return udpReady && udp != null && System.currentTimeMillis() - udpAckT < UDP_STALE_MS;
     }
 
     void sendJson(int type, JSONObject o) { send(type, o.toString().getBytes(StandardCharsets.UTF_8)); }
@@ -191,6 +213,8 @@ final class Link {
         // the view may have been measured after HELLO went out
         if (viewW > 0) sendJson(T_VIEW, viewJson());
         Log.i("foldpen", "connected " + host + ":" + port);
+        String key = st.optString("udp", "");
+        if (!key.isEmpty() && !host.equals("127.0.0.1")) startUdp(host, port, key);
         listener.onConnected(true);
         listener.onState(st);
         try {
@@ -210,9 +234,100 @@ final class Link {
             Log.i("foldpen", "session ended: " + e + " running=" + running);
             throw e;
         } finally {
+            stopUdp();
             boolean was = out != null;
             out = null;
             if (was) listener.onConnected(false);
+        }
+    }
+
+    // ---------------------------------------------------------------- UDP
+
+    private void startUdp(String host, int port, String keyHex) {
+        try {
+            byte[] key = new byte[8];
+            for (int i = 0; i < 8; i++) key[i] = (byte) Integer.parseInt(keyHex.substring(2 * i, 2 * i + 2), 16);
+            DatagramSocket ds = new DatagramSocket();
+            ds.connect(new InetSocketAddress(host, port));
+            udpKey = key;
+            udpReady = false;
+            penQueue.clear();
+            udp = ds;
+            Thread rx = new Thread(() -> udpReceive(ds, key), "foldpen-udp-rx");
+            Thread tx = new Thread(() -> udpSend(ds, key), "foldpen-udp-tx");
+            tx.setPriority(Thread.MAX_PRIORITY);
+            rx.start();
+            tx.start();
+            // the daemon writes first, to this port: our replies are then an
+            // established flow through the PC's firewall
+            JSONObject m = new JSONObject().put("cmd", "udp").put("port", ds.getLocalPort());
+            queue.offer(frame(T_CMD, m.toString().getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            Log.i("foldpen", "udp off: " + e);
+        }
+    }
+
+    private void stopUdp() {
+        udpReady = false;
+        DatagramSocket ds = udp;
+        udp = null;
+        if (ds != null) ds.close();   // ends both threads
+        penQueue.clear();
+    }
+
+    /** The daemon's keepalives; heard = 1 once our packets reach it. */
+    private void udpReceive(DatagramSocket ds, byte[] key) {
+        byte[] buf = new byte[32];
+        while (udp == ds) {
+            try {
+                DatagramPacket p = new DatagramPacket(buf, buf.length);
+                ds.receive(p);
+                if (p.getLength() < 10 || buf[0] != 'A') continue;
+                boolean ok = true;
+                for (int i = 0; i < 8; i++) ok &= buf[1 + i] == key[i];
+                if (!ok) continue;
+                udpAckT = System.currentTimeMillis();
+                if (buf[9] == 1 && !udpReady) { udpReady = true; Log.i("foldpen", "pen over UDP"); }
+            } catch (IOException e) {
+                if (udp != ds) return;
+            }
+        }
+    }
+
+    private void udpSend(DatagramSocket ds, byte[] key) {
+        ArrayDeque<byte[]> hist = new ArrayDeque<>();   // seq:u32 + pen[25]
+        int seq = 0, repeats = 0;
+        byte[] last = null;
+        long lastProbe = 0;
+        while (udp == ds) {
+            try {
+                long wait = !udpReady ? UDP_PROBE_MS : repeats > 0 ? UDP_REPEAT_MS : 1000;
+                byte[] pen = penQueue.poll(wait, TimeUnit.MILLISECONDS);
+                if (pen != null) {
+                    ByteBuffer s = ByteBuffer.allocate(29);
+                    s.putInt(++seq).put(pen);
+                    hist.addLast(s.array());
+                    while (hist.size() > UDP_HISTORY) hist.removeFirst();
+                    ByteBuffer d = ByteBuffer.allocate(10 + 29 * hist.size());
+                    d.put((byte) 'P').put(key).put((byte) hist.size());
+                    for (byte[] h : hist) d.put(h);
+                    last = d.array();
+                    ds.send(new DatagramPacket(last, last.length));
+                    repeats = UDP_REPEATS;
+                } else if (repeats > 0 && last != null) {
+                    ds.send(new DatagramPacket(last, last.length));   // a lift must not be lost
+                    repeats--;
+                }
+                long now = System.currentTimeMillis();
+                if (!udpReady && now - lastProbe >= UDP_PROBE_MS) {
+                    lastProbe = now;
+                    byte[] h = ByteBuffer.allocate(9).put((byte) 'H').put(key).array();
+                    ds.send(new DatagramPacket(h, h.length));
+                }
+            } catch (InterruptedException ignored) {
+            } catch (IOException e) {
+                if (udp != ds) return;
+            }
         }
     }
 

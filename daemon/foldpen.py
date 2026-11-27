@@ -70,7 +70,7 @@ TIP_FLOOR = 0.06
 # holds at the end: tip-up and proximity-out in one instant reached Rnote
 # (GTK4) as the pen leaving while pressed -- a cancelled stroke, discarded on
 # lift -- so proximity-out follows the tip-up by as much.
-PROX_LEAD = 0.03
+PROX_LEAD = 0.03       # fallback; the live value is two frames of the bound monitor
 # The phone sends a finger-pen stroke's first ~60-200 ms in one burst (held
 # until it qualified as writing). Toolkits merge motion that arrives in one
 # frame, so the burst collapsed and the line began where it ended, behind
@@ -79,11 +79,25 @@ PROX_LEAD = 0.03
 PEN_PACE = 0.004
 # Pen samples carry the phone's own timestamp and are replayed on that
 # timeline: due = phone time + clock offset (the smallest transit seen lately)
-# + PEN_JITTER. adb-over-Wi-Fi delivered ~1 in 4 samples in bursts, which
-# toolkits merged into one point -- curves (digits!) came out as polylines.
-# A late sample (a stroke's held start) replays at CATCHUP x speed instead.
-PEN_JITTER = 0.012
+# + a playout buffer. adb-over-Wi-Fi delivered ~1 in 4 samples in bursts,
+# which toolkits merged into one point -- curves (digits!) came out as
+# polylines. The buffer is the PEN_JITTER_Q quantile of how much later than
+# the fastest sample the recent ones arrived, clamped to PEN_JITTER_MIN..MAX:
+# ~2 ms over USB, more on a jittery Wi-Fi link. A sample later than that
+# replays at CATCHUP x speed instead.
+PEN_JITTER_Q = 0.9
+PEN_JITTER_MIN, PEN_JITTER_MAX = 0.002, 0.030
 CATCHUP = 2.0
+# Pen samples over UDP (LAN only; adb reverse carries TCP only). Over TCP one
+# lost Wi-Fi packet stalls every sample behind it until the retransmit; each
+# datagram repeats the last few samples instead, so a loss costs nothing.
+#   phone -> PC  b"P" key[8] n:u8 n x (seq:u32 pen[25])   oldest first
+#                b"H" key[8]                              probe
+#   PC -> phone  b"A" key[8] heard:u8                     keepalive / ack
+# The key is per connection, handed out over the authenticated TCP link. The
+# PC sends first, to the port the phone names over TCP, so the phone's
+# packets come back as an established flow through the PC's firewall.
+UDP_KEEPALIVE = 2.0
 
 STYLUS_NAME = "foldpen-stylus"
 TOUCH_NAME = "foldpen-touch"
@@ -110,13 +124,14 @@ def hyprctl(*args):
 
 def monitor_info():
     """Logical layout boxes of the enabled monitors, {name: (x, y, w, h)},
-    and their transforms, {name: 0..7}. A 180 degree rotation leaves the box
-    as it was, so a change is only seen in the transforms."""
+    their transforms, {name: 0..7}, and refresh rates, {name: Hz}. A 180
+    degree rotation leaves the box as it was, so a change is only seen in the
+    transforms."""
     try:
         data = json.loads(hyprctl("-j", "monitors") or "[]")
     except json.JSONDecodeError:
-        return {}, {}
-    boxes, xforms = {}, {}
+        return {}, {}, {}
+    boxes, xforms, rates = {}, {}, {}
     for m in data:
         if m.get("disabled"):
             continue
@@ -125,7 +140,8 @@ def monitor_info():
             w, h = h, w
         boxes[m["name"]] = (float(m["x"]), float(m["y"]), w, h)
         xforms[m["name"]] = m.get("transform", 0)
-    return boxes, xforms
+        rates[m["name"]] = float(m.get("refreshRate") or 60.0)
+    return boxes, xforms, rates
 
 
 def monitors():
@@ -304,6 +320,7 @@ class Daemon:
         self.st = State()
         self.view = (2160, 1856)    # phone view px (Fold 6 inner screen) until told
         self.mons = {}
+        self.rates = {}             # monitor refresh rates, Hz
         self.mon = None             # name the devices are bound to
         self.client = None          # (reader, writer)
         self.overlay = None
@@ -318,12 +335,27 @@ class Daemon:
         self.pen_timer = None
         self.transit = collections.deque()       # (arrival, arrival - phone s)
         self.last_play = None                    # (phone s, local s) of the last played
+        self.pen_buffer = PEN_JITTER_MAX         # playout buffer, s (see PEN_JITTER_Q)
+        self.pen_buffer_t = 0.0
+        self.udp = None                          # the UDP transport
+        self.udp_key = None                      # this connection's key
+        self.udp_peer = None                     # (ip, port) the phone named
+        self.udp_heard = False                   # a valid datagram has arrived
+        self.udp_seq = 0                         # last pen sample seq played
         self.refresh_monitors()
 
     # geometry ----------------------------------------------------------------
     def refresh_monitors(self):
-        self.mons = monitors() or self.mons
+        boxes, _, rates = monitor_info()
+        self.mons = boxes or self.mons
+        self.rates = rates or self.rates
         self.fit_rect()
+
+    @property
+    def prox_lead(self):
+        """Two compositor frames of the bound monitor (see PROX_LEAD)."""
+        hz = self.rates.get(self.mon) if self.mon else None
+        return min(max(2.0 / hz, 0.012), PROX_LEAD) if hz else PROX_LEAD
 
     def aspect(self):
         return self.view[0] / self.view[1]
@@ -502,7 +534,9 @@ class Daemon:
             self.client = (reader, writer)
             log(f"phone connected: {peer} {hello.get('model', '')}")
             self.set_view(hello)
-            writer.write(pack(T_STATE, self.state_msg(**reply)))
+            self.udp_key, self.udp_peer, self.udp_heard, self.udp_seq = secrets.token_bytes(8), None, False, 0
+            self.pen_buffer, self.transit = PEN_JITTER_MAX, collections.deque()
+            writer.write(pack(T_STATE, self.state_msg(**reply, udp=self.udp_key.hex())))
             frames = asyncio.get_running_loop().create_task(self.frame_loop(writer))
             try:
                 while True:
@@ -515,6 +549,7 @@ class Daemon:
         finally:
             if self.client and self.client[1] is writer:
                 self.client = None
+                self.udp_key, self.udp_peer, self.udp_heard = None, None, False
                 self.pen_q = None
                 self.pen_line.clear()
                 self.after_out = []
@@ -570,6 +605,13 @@ class Daemon:
                     m["label"] = lab[0]
                     with open(STATE_DIR / "calib.jsonl", "a") as f:
                         f.write(json.dumps(m) + "\n")
+            elif cmd == "udp" and self.client:
+                # the phone's UDP port; only on its own address
+                ip = self.client[1].get_extra_info("peername")[0]
+                port = int(m.get("port", 0))
+                if 0 < port < 65536:
+                    self.udp_peer = (ip, port)
+                    self.udp_send_ack()
             elif cmd == "log":
                 log("phone:", str(m.get("l", ""))[:300])
             elif cmd == "rect" and self.st.rect and self.mon:
@@ -581,22 +623,32 @@ class Daemon:
     def pen_receive(self, ts, ev):
         now = time.monotonic()
         tr = self.transit
-        tr.append((now, now - ts))
+        tr.append((now, now - ts, bool(ev[0] & PEN_TOUCH)))
         while tr and now - tr[0][0] > 3.0:
             tr.popleft()
+        if now - self.pen_buffer_t > 0.25:
+            # Sized from samples in contact: the phone batches hover samples
+            # (four every ~8 ms) but delivers contact ones one by one, and
+            # hover lateness would hold every stroke back by a batch.
+            touch = [d for _, d, t in tr if t]
+            if len(touch) >= 20:
+                self.pen_buffer_t = now
+                lo = min(d for _, d, _ in tr)
+                late = sorted(d - lo for d in touch)
+                self.pen_buffer = min(max(late[int(PEN_JITTER_Q * (len(late) - 1))], PEN_JITTER_MIN), PEN_JITTER_MAX)
         self.pen_line.append((ts, ev))
         self.pen_pump()
 
     def pen_pump(self):
-        """Play queued samples out at their phone timing (see PEN_JITTER)."""
+        """Play queued samples out at their phone timing (see PEN_JITTER_Q)."""
         if self.pen_timer:
             self.pen_timer.cancel()
             self.pen_timer = None
-        offset = min(d for _, d in self.transit) if self.transit else 0.0
+        offset = min(d for _, d, _ in self.transit) if self.transit else 0.0
         while self.pen_line:
             ts, ev = self.pen_line[0]
             now = time.monotonic()
-            due = ts + offset + PEN_JITTER
+            due = ts + offset + self.pen_buffer
             lp = self.last_play
             if lp and 0 <= ts - lp[0] < 0.25:          # same stroke: keep the spacing
                 due = max(due, lp[1] + (ts - lp[0]) / CATCHUP)
@@ -626,11 +678,11 @@ class Daemon:
             if st["range"]:
                 if st["touch"]:
                     self.dev.pen_event(PEN_IN_RANGE, x, y, 0.0, tx, ty)    # tip up, still near
-                self.prox_out = loop.call_later(PROX_LEAD, self.leave, x, y)
+                self.prox_out = loop.call_later(self.prox_lead, self.leave, x, y)
         elif flags & PEN_TOUCH and not st["range"]:
             self.dev.pen_event(flags & ~PEN_TOUCH, x, y, 0.0, tx, ty)  # proximity in alone
             self.pen_q = [ev]
-            loop.call_later(PROX_LEAD, self.flush_pen)
+            loop.call_later(self.prox_lead, self.flush_pen)
         else:
             self.dev.pen_event(*ev)
 
@@ -654,6 +706,40 @@ class Daemon:
         elif q:
             self.pen_q = q
             asyncio.get_running_loop().call_later(PEN_PACE, self.flush_pen)
+
+    # pen over UDP ------------------------------------------------------------------
+    def udp_send_ack(self):
+        if self.udp and self.udp_peer and self.udp_key:
+            self.udp.sendto(b"A" + self.udp_key + bytes([self.udp_heard]), self.udp_peer)
+
+    def udp_datagram(self, data, addr):
+        """A pen datagram: accepted only with this connection's key, from the
+        address the phone named over TCP."""
+        key = self.udp_key
+        if not key or addr != self.udp_peer or len(data) < 9 or not secrets.compare_digest(data[1:9], key):
+            return
+        if not self.udp_heard:
+            self.udp_heard = True
+            log(f"phone: pen over UDP from {addr[0]}:{addr[1]}")
+        kind = data[:1]
+        if kind == b"H":
+            self.udp_send_ack()
+        elif kind == b"P" and len(data) >= 10:
+            n = data[9]
+            for i in range(n):
+                off = 10 + i * 29
+                if off + 29 > len(data):
+                    break
+                seq = struct.unpack_from(">I", data, off)[0]
+                if seq <= self.udp_seq:
+                    continue                  # a repeat of one already played
+                self.udp_seq = seq
+                self.handle(T_PEN, data[off + 4:off + 29])
+
+    async def udp_keepalive(self):
+        while True:
+            await asyncio.sleep(UDP_KEEPALIVE)
+            self.udp_send_ack()
 
     # display forwarding ----------------------------------------------------------
     async def frame_loop(self, writer):
@@ -770,7 +856,9 @@ class Daemon:
         elif w[:1] != ["status"]:
             return {"error": "usage: toggle|set|pair|status|monitors"}
         return {**self.state_msg(), "connected": self.client is not None,
-                "monitor": self.mon, "rect": self.st.rect}
+                "monitor": self.mon, "rect": self.st.rect,
+                "pen_buffer_ms": round(self.pen_buffer * 1000, 1),
+                "pen_udp": self.udp_heard, "prox_lead_ms": round(self.prox_lead * 1000, 1)}
 
     async def watch_monitors(self):
         # Cheap poll for hotplug and rotation. The transforms are compared
@@ -778,7 +866,7 @@ class Daemon:
         xforms = monitor_info()[1]
         while True:
             await asyncio.sleep(3)
-            m, x = monitor_info()
+            m, x, _ = monitor_info()
             if m and (m != self.mons or x != xforms):
                 xforms = x
                 self.mon = None   # force a re-bind (outputs may have moved)
@@ -811,12 +899,21 @@ class Daemon:
 
     async def run(self):
         servers = [await asyncio.start_server(self.on_client, self.args.bind, self.args.port)]
+        daemon = self
+
+        class Udp(asyncio.DatagramProtocol):
+            def datagram_received(self, data, addr):
+                daemon.udp_datagram(data, addr)
+
+        self.udp, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+            Udp, local_addr=(self.args.bind, self.args.port))
         if CTL_SOCK.exists():
             CTL_SOCK.unlink()
         servers.append(await asyncio.start_unix_server(self.on_ctl, str(CTL_SOCK)))
         os.chmod(CTL_SOCK, 0o600)
         log(f"listening on {self.args.bind}:{self.args.port}; monitor {self.mon}")
-        tasks = [asyncio.create_task(self.watch_monitors()), asyncio.create_task(self.watch_reloads())]
+        tasks = [asyncio.create_task(self.watch_monitors()), asyncio.create_task(self.watch_reloads()),
+                 asyncio.create_task(self.udp_keepalive())]
         if not self.args.no_beacon:
             tasks.append(asyncio.create_task(self.beacon()))
         stop = asyncio.Event()
@@ -916,7 +1013,21 @@ APP = "dev.foldpen"
 
 
 def adb(*a, check=True):
-    return subprocess.run(["adb", *a], check=check, capture_output=True, text=True)
+    return subprocess.run(["adb", *usb_serial(), *a], check=check, capture_output=True, text=True)
+
+
+def usb_serial():
+    """`-s SERIAL` for the one device attached over USB, so a Waydroid
+    container or a phone on wireless debugging is never the one set up.
+    ANDROID_SERIAL, when set, decides instead."""
+    if os.environ.get("ANDROID_SERIAL"):
+        return []
+    out = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True).stdout
+    usb = [l.split()[0] for l in out.splitlines()[1:] if " device " in l + " " and " usb:" in l]
+    if len(usb) != 1:
+        sys.exit("foldpen: " + ("no phone on USB (USB debugging on, prompt accepted?)" if not usb
+                                else f"several phones on USB ({', '.join(usb)}): set ANDROID_SERIAL"))
+    return ["-s", usb[0]]
 
 
 def push_to_phone(port):
